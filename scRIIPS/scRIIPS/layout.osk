@@ -1,0 +1,10 @@
+OSKLAYOUT	1
+SET	bg	1E1E1E
+SET	fontSize	14
+SET	height	200
+SET	hoverBtn	1
+SET	hoverDelay	700
+SET	sticky	0
+SET	title	My On-Screen Keyboard
+SET	trans	235
+SET	widthPct	60
