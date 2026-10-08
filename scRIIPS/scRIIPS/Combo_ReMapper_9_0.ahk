@@ -1,5 +1,5 @@
 ; ============================================================
-; Combo ReMapper 8.19 — SWITCHABLE COMPATIBILITY MODES
+; Combo ReMapper 9.0 — TglTurbo MODE, CONTROLLER ON/OFF COMBO, RIGHT-CLICK FIX / SWITCHABLE COMPATIBILITY MODES
 ; Mouse actions + Gamepad (controller) support
 ; ============================================================
 #Requires AutoHotkey v2.0
@@ -35,10 +35,21 @@ try ProcessSetPriority("High")
 DllCall("winmm\timeBeginPeriod", "UInt", 1)
 
 OnExit(HandleExit)
+; Safety net: an unexpected error in a hotkey thread is logged and that thread
+; stops, but the whole program no longer closes.
+OnError(HandleUnexpectedError)
+HandleUnexpectedError(err, mode) {
+    try LogEvent("ERROR: " . err.Message . "  (line " . err.Line . ")", true)
+    try ReleaseAllHeldCombos()
+    return 1
+}
 
 ; ---- Global State Initializations ----
 global scriptEnabled := true
 global yAxisLocked := false
+global seqHeldKeys := Map()          ; keys held by down:/up: tokens, so they can always be released
+global yLockKey := "F6"              ; hotkey for the Y-axis lock; blank = disabled
+global registeredYLockKey := ""
 global lockedYCoord := 0
 global osdGui := ""
 global osdText := ""
@@ -51,7 +62,7 @@ global turboTimers := Map()
 
 ; ---- Mouse & Controller state ----
 global mouseHeld := Map()           ; tracks left/right/middle buttons held by engine
-global controllerEnabled := true    ; master switch for gamepad polling
+global controllerEnabled := false   ; master switch for gamepad polling (off by default since 9.0)
 global joyButtonState := Map()      ; per-button last-seen state (edge detection)
 global joyPovState := ""            ; last POV direction seen
 global stickDeadzone := 0.25        ; reserved for optional stick triggers
@@ -81,6 +92,28 @@ global padScrollSpeed := 12         ; wheel ticks per second at full deflection
 global padTrigThresh := 40          ; trigger press threshold (0-255)
 global mouseScale := 100            ; percent, applies to m / mm / mshake / mh tokens
 global padMouseTimerOn := false
+global pressExtraMs := 0            ; extra milliseconds added to every key press
+global padPanic := true             ; hold Start+Back / Share+Options to stop
+global padPanicStart := 0
+global padSwitchCombo := ""        ; blank = default (Xbox Start+Back / PS4 Share+Options); else e.g. XLB+XRB+XSTART
+global padPanicFired := false
+global chordDown := Map()           ; controller chord triggers currently held
+global doubleTapLast := Map()       ; trigger -> tick of its last press (DblTap mode)
+global tipMap := Map()              ; control hwnd -> hover tip text
+global tipLast := ""
+global tipWinHwnd := 0
+global helpGui := 0
+global advGui := 0
+global jsPrev := Map()              ; DirectInput stick-direction tokens down on the previous poll
+global autoProfile := false         ; auto-switch profile by active game window
+global autoProfLastExe := ""
+global fireLog := []                ; recent events for the Fire Log window
+global logGui := 0
+global logLV := 0
+global logClearBtn := 0
+global logCloseBtn := 0
+global logLastMsg := ""
+global logLastTick := 0
 global padSrc := 1                  ; stick source: 1 = XInput, 2 = DirectInput (DualShock etc.)
 global padLast := 0.0
 global padAccX := 0.0
@@ -116,6 +149,7 @@ globalSettingsFile := A_ScriptDir "\remapper_global.ini"
 
 currentProfile := "default"
 try currentProfile := IniRead(globalSettingsFile, "Global", "LastProfile", "default")
+try autoProfile := (IniRead(globalSettingsFile, "Global", "AutoProfile", "0") = "1")
 if !FileExist(profilesDir "\" currentProfile ".ini")
     currentProfile := "default"
 configFile := profilesDir "\" currentProfile ".ini"
@@ -166,7 +200,18 @@ IsJoyTrigger(trig) {
     if (trig = "")
         return false
     t := StrUpper(Trim(RegExReplace(trig, "^~")))
-    if RegExMatch(t, "^J(\d{1,2}|POV[UDLR])$")
+    if InStr(t, "+") {
+        ; Chord: several controller buttons held together, e.g. J5+J6
+        chordParts := StrSplit(t, "+")
+        if (chordParts.Length < 2)
+            return false
+        for part in chordParts {
+            if (part = "" || InStr(part, "+") || !IsJoyTrigger(part))
+                return false
+        }
+        return true
+    }
+    if RegExMatch(t, "^J(\d{1,2}|POV[UDLR]|[LR]S[UDLR])$")
         return true
     ; XInput (Xbox-style pad): XA XB XX XY XLB XRB XBACK XSTART XLS XRS XUP XDOWN XLEFT XRIGHT XLT XRT
     ; and stick directions XLSU/XLSD/XLSL/XLSR, XRSU/XRSD/XRSL/XRSR
@@ -190,7 +235,14 @@ IsMouseActionToken(key) {
         return true
     if RegExMatch(k, "^mh-?\d+,-?\d+$")
         return true
+    if RegExMatch(k, "^mwave-?\d+,-?\d+,\d+,\d+$")
+        return true
     return false
+}
+
+IsKeyHoldToken(key) {
+    ; down:q = press q and keep it down, up:q = let q go (used inside one combo)
+    return RegExMatch(Trim(key), "i)^(down|up):\S+$") ? true : false
 }
 
 IsHoldMotionToken(key) {
@@ -245,6 +297,8 @@ ParseKeyList(raw) {
             extra := 1
         else if RegExMatch(trimmed, "i)^mm-?\d+$")
             extra := 2
+        else if RegExMatch(trimmed, "i)^mwave-?\d+$")
+            extra := 3
         loop extra {
             if (i < parts.Length && RegExMatch(Trim(parts[i + 1]), "^-?\d+$")) {
                 trimmed .= "," . Trim(parts[i + 1])
@@ -308,6 +362,7 @@ FlashOSD(msg, colorHex := "00FFFF", ms := 700) {
 
 NotifyUser(msg, duration := -1000) {
     global showTooltips, soundAlerts
+    LogEvent("* " . msg)
     if (soundAlerts)
         SoundBeep(750, 100)
     if (showTooltips) {
@@ -327,10 +382,10 @@ CompatModeNames() {
 }
 
 GetPressHold() {
-    global keyDelayPress, compatMode
+    global keyDelayPress, compatMode, pressExtraMs
     if (compatMode = 2)
-        return 20
-    return Max(keyDelayPress, 35)
+        return 20 + pressExtraMs
+    return Max(keyDelayPress, 35) + pressExtraMs
 }
 
 RelMoveRaw(dx, dy) {
@@ -351,9 +406,30 @@ MouseSleep() {
         Sleep(mouseDelayDuration)
 }
 
+; True when some row uses this mouse button as its TRIGGER. The engine must then
+; send that button in a way AutoHotkey recognises as its own, otherwise the
+; trigger hotkey catches our own click, swallows it and fires again forever
+; (that endless loop is what crashed the program with Right Click as trigger).
+IsOwnTriggerButton(lowName) {
+    global rows
+    for row in rows {
+        t := StrLower(LTrim(Trim(row.trigger), "~*"))
+        if (t = lowName)
+            return true
+    }
+    return false
+}
+
 MouseButtonEvent(name, isDown) {
     global compatMode
     data := 0
+    lowBtn := StrLower(Trim(name))
+    if (compatMode = 1 && RegExMatch(lowBtn, "^(lbutton|rbutton|mbutton|xbutton1|xbutton2)$") && IsOwnTriggerButton(lowBtn)) {
+        ; SendEvent uses mouse_event too, but tags it so our own hotkeys ignore it
+        ; while the game still receives it.
+        SendEvent("{Blind}{" . lowBtn . (isDown ? " down}" : " up}"))
+        return true
+    }
     if (compatMode != 1) {
         lowName := StrLower(name)
         if !RegExMatch(lowName, "^(lbutton|rbutton|mbutton|xbutton1|xbutton2)$")
@@ -464,6 +540,30 @@ MouseShake(amp, ms) {
         RelMoveScaled(-offX, -offY)
 }
 
+MouseWave(dx, dy, ms, stepMs) {
+    ; Waggle: the cursor swings between +(dx,dy) and -(dx,dy) of where it started,
+    ; one swing every stepMs milliseconds, for ms milliseconds, then returns to the
+    ; start. Handy for "shake the controller" prompts (e.g. katana recharge).
+    global motionEpoch
+    epoch := motionEpoch
+    startT := NowMs()
+    curX := 0
+    curY := 0
+    dir := -1
+    stepMs := Max(4, stepMs)
+    while (NowMs() - startT < ms && epoch = motionEpoch) {
+        tx := dir * dx
+        ty := dir * dy
+        RelMoveScaled(tx - curX, ty - curY)
+        curX := tx
+        curY := ty
+        dir := -dir
+        Sleep(stepMs)
+    }
+    if (curX != 0 || curY != 0)
+        RelMoveScaled(-curX, -curY)
+}
+
 StartHoldMotion(trig, vx, vy) {
     global holdMotion, MOTION_TICK_MS
     StopHoldMotion(trig)
@@ -546,7 +646,7 @@ SetCompatMode(mode, *) {
 
 GameKeyDown(name) {
     n := Trim(name)
-    if (n = "" || IsJoyTrigger(n) || IsMouseActionToken(n))
+    if (n = "" || IsJoyTrigger(n) || IsMouseActionToken(n) || IsKeyHoldToken(n))
         return
     low := StrLower(n)
     if (low = "wheelup") {
@@ -564,7 +664,7 @@ GameKeyDown(name) {
 
 GameKeyUp(name) {
     n := Trim(name)
-    if (n = "" || IsJoyTrigger(n) || IsMouseActionToken(n))
+    if (n = "" || IsJoyTrigger(n) || IsMouseActionToken(n) || IsKeyHoldToken(n))
         return
     low := StrLower(n)
     if (low = "wheelup" || low = "wheeldown")
@@ -630,6 +730,10 @@ RunMouseToken(lowerKey) {
         MouseSmoothMove(Integer(m[1]), Integer(m[2]), Integer(m[3]))
         return true
     }
+    if RegExMatch(lowerKey, "^mwave(-?\d+),(-?\d+),(\d+),(\d+)$", &m) {
+        MouseWave(Integer(m[1]), Integer(m[2]), Integer(m[3]), Integer(m[4]))
+        return true
+    }
     if RegExMatch(lowerKey, "^mshake(\d+),(\d+)$", &m) {
         MouseShake(Integer(m[1]), Integer(m[2]))
         return true
@@ -664,13 +768,14 @@ StartControllerPolling() {
 }
 
 StopControllerPolling() {
-    global controllerTimerActive, joyButtonState, joyPovState, xiPrev
+    global controllerTimerActive, joyButtonState, joyPovState, xiPrev, jsPrev
     if (controllerTimerActive)
         SetTimer(PollController, 0)
     controllerTimerActive := false
     joyButtonState := Map()
     joyPovState := ""
     xiPrev := Map()
+    jsPrev := Map()
     UpdatePadMouseTimer()
 }
 
@@ -692,7 +797,7 @@ UseDirect() {
 SetPadType(mode, *) {
     ; Switch between Xbox (XInput) and PS4 (DirectInput). Anything held through the
     ; old input path is released first so nothing stays stuck.
-    global padType, joyButtonState, joyPovState, xiPrev, configFile
+    global padType, joyButtonState, joyPovState, xiPrev, jsPrev, configFile
     if (mode = padType)
         return
     for n, st in joyButtonState.Clone() {
@@ -703,9 +808,12 @@ SetPadType(mode, *) {
         HandleRelease(joyPovState)
     for tok, v in xiPrev.Clone()
         HandleRelease(tok)
+    for tok, v in jsPrev.Clone()
+        HandleRelease(tok)
     joyButtonState := Map()
     joyPovState := ""
     xiPrev := Map()
+    jsPrev := Map()
     padType := mode
     try IniWrite(padType, configFile, "Settings", "PadType")
     BuildTrayMenu()
@@ -823,6 +931,34 @@ XInputTokens() {
         down["XRSU"] := true
     if (ry < -thr)
         down["XRSD"] := true
+    return down
+}
+
+JoyStickTokens() {
+    ; DirectInput stick directions as digital tokens (DualShock 4: left = X/Y, right = Z/R):
+    ; JLSU JLSD JLSL JLSR (left stick) and JRSU JRSD JRSL JRSR (right stick).
+    down := Map()
+    thr := 0.55
+    lx := AxisToNorm(JoyAxis("X"))
+    ly := -AxisToNorm(JoyAxis("Y"))
+    rx := AxisToNorm(JoyAxis("Z"))
+    ry := -AxisToNorm(JoyAxis("R"))
+    if (lx > thr)
+        down["JLSR"] := true
+    if (lx < -thr)
+        down["JLSL"] := true
+    if (ly > thr)
+        down["JLSU"] := true
+    if (ly < -thr)
+        down["JLSD"] := true
+    if (rx > thr)
+        down["JRSR"] := true
+    if (rx < -thr)
+        down["JRSL"] := true
+    if (ry > thr)
+        down["JRSU"] := true
+    if (ry < -thr)
+        down["JRSD"] := true
     return down
 }
 
@@ -987,11 +1123,20 @@ GetPovName() {
 JoyTriggerDown(token) {
     global joyId, xiUser
     t := StrUpper(Trim(token))
+    if InStr(t, "+") {
+        for part in StrSplit(t, "+") {
+            if (!JoyTriggerDown(part))
+                return false
+        }
+        return true
+    }
     if (SubStr(t, 1, 1) = "X") {
         if (!XInputPoll())
             return false
         return XInputTokens().Has(t)
     }
+    if RegExMatch(t, "^J[LR]S[UDLR]$")
+        return JoyStickTokens().Has(t)
     if RegExMatch(t, "^J(\d{1,2})$", &m)
         return GetKeyState(joyId . "Joy" . m[1]) ? true : false
     return (GetPovName() = t)
@@ -1013,8 +1158,9 @@ WaitTriggerRelease(trig, ms) {
 }
 
 PollController() {
-    global controllerEnabled, scriptEnabled, joyButtonState, joyPovState, xiPrev
+    global controllerEnabled, scriptEnabled, joyButtonState, joyPovState, xiPrev, jsPrev
     global targetExe, joyId, joyDetectTick
+    global padPanic, padPanicStart, padPanicFired, chordDown
 
     if (!controllerEnabled)
         return
@@ -1028,6 +1174,9 @@ PollController() {
         joyButtonState := Map()
         joyPovState := ""
         xiPrev := Map()
+        jsPrev := Map()
+        chordDown := Map()
+        PadSwitchTick()   ; the controller on/off combo works even while the remapper is OFF
         return
     }
 
@@ -1065,6 +1214,24 @@ PollController() {
         joyPovState := povName
     }
 
+    ; --- Stick directions (DualShock etc.) as buttons ---
+    if (JoyPresent()) {
+        curS := JoyStickTokens()
+        for tok, v in curS {
+            if (!jsPrev.Has(tok))
+                HandlePress(tok)
+        }
+        for tok, v in jsPrev.Clone() {
+            if (!curS.Has(tok))
+                HandleRelease(tok)
+        }
+        jsPrev := curS
+    } else if (jsPrev.Count > 0) {
+        for tok, v in jsPrev.Clone()
+            HandleRelease(tok)
+        jsPrev := Map()
+    }
+
     }
 
     ; --- XInput (Xbox-style pads: buttons, separate triggers, stick directions) ---
@@ -1084,13 +1251,141 @@ PollController() {
             HandleRelease(tok)
         xiPrev := Map()
     }
+
+    ; --- Chord triggers (J5+J6, XLB+XRB ...): fire while every part is held ---
+    for chordRow in rows {
+        chordTrig := StrUpper(Trim(chordRow.trigger))
+        if (!InStr(chordTrig, "+") || !IsJoyTrigger(chordTrig))
+            continue
+        allDown := true
+        for part in StrSplit(chordTrig, "+") {
+            if (!ChordPartDown(part)) {
+                allDown := false
+                break
+            }
+        }
+        wasDown := chordDown.Has(chordTrig)
+        if (allDown && !wasDown) {
+            chordDown[chordTrig] := true
+            HandlePress(chordTrig)
+        } else if (!allDown && wasDown) {
+            chordDown.Delete(chordTrig)
+            HandleRelease(chordTrig)
+        }
+    }
+
+    ; --- Controller on/off combo (default Start+Back / Share+Options, hold 1 second) ---
+    PadSwitchTick()
+}
+
+; Everything the controller is holding right now, as tokens (XSTART, J9, JPOVUP ...)
+PadSnapshot() {
+    global joyId
+    held := Map()
+    if (UseXInput() && XInputPoll()) {
+        for tok, v in XInputTokens()
+            held[tok] := true
+    }
+    if (UseDirect()) {
+        loop 32 {
+            if GetKeyState(joyId . "Joy" . A_Index)
+                held["J" . A_Index] := true
+        }
+        pov := StrUpper(GetPovName())
+        if (pov != "")
+            held[pov] := true
+        if JoyPresent() {
+            for tok, v in JoyStickTokens()
+                held[tok] := true
+        }
+    }
+    return held
+}
+
+PadSwitchHeld() {
+    global padSwitchCombo
+    held := PadSnapshot()
+    combo := StrUpper(Trim(padSwitchCombo))
+    if (combo = "") {
+        if (held.Has("XSTART") && held.Has("XBACK"))
+            return true
+        return held.Has("J9") && held.Has("J10")
+    }
+    parts := 0
+    for part in StrSplit(combo, "+") {
+        part := Trim(part)
+        if (part = "")
+            continue
+        parts += 1
+        if !held.Has(part)
+            return false
+    }
+    return parts > 0
+}
+
+; Hold the combo for 1 second: switches the remapper OFF, or back ON again.
+PadSwitchTick() {
+    global padPanic, padPanicStart, padPanicFired
+    if (padPanic && PadSwitchHeld()) {
+        if (padPanicStart = 0) {
+            padPanicStart := A_TickCount
+        } else if (!padPanicFired && A_TickCount - padPanicStart >= 1000) {
+            padPanicFired := true
+            ToggleScript()
+        }
+    } else {
+        padPanicStart := 0
+        padPanicFired := false
+    }
+}
+
+; Settings "Detect" button: hold the buttons you want (together), then let go.
+DetectPadSwitch(editCtrl, btn, *) {
+    btn.Enabled := false
+    btn.Text := "Hold..."
+    seen := Map()
+    order := []
+    anyHeld := false
+    t0 := A_TickCount
+    NotifyUser("Hold the controller buttons you want, then let go.", -6000)
+
+    DetectTick() {
+        held := PadSnapshot()
+        if (held.Count > 0) {
+            anyHeld := true
+            for tok, v in held {
+                if (!seen.Has(tok) && order.Length < 4) {
+                    seen[tok] := true
+                    order.Push(tok)
+                }
+            }
+        }
+        if ((anyHeld && held.Count = 0) || A_TickCount - t0 > 8000) {
+            SetTimer(DetectTick, 0)
+            if (order.Length > 0)
+                editCtrl.Value := JoinArray(order, "+")
+            btn.Text := "Detect"
+            btn.Enabled := true
+        }
+    }
+    SetTimer(DetectTick, 30)
+}
+
+ChordPartDown(part) {
+    global joyButtonState, joyPovState, jsPrev, xiPrev
+    t := StrUpper(Trim(part))
+    if RegExMatch(t, "^J(\d{1,2})$", &m)
+        return joyButtonState.Has(Integer(m[1])) && joyButtonState[Integer(m[1])]
+    if (t = joyPovState)
+        return true
+    return jsPrev.Has(t) || xiPrev.Has(t)
 }
 
 ; ============================================================
 ; ---- System Tray Context Menu Engine ----
 ; ============================================================
 BuildTrayMenu() {
-    global currentProfile, compatMode, padType
+    global currentProfile, compatMode, padType, autoProfile
     A_TrayMenu.Delete()
     A_TrayMenu.Add("Toggle Engine", ToggleScript)
     A_TrayMenu.Add("Toggle OSD Overlay", ToggleOSDOverlay)
@@ -1121,6 +1416,17 @@ BuildTrayMenu() {
     }
     A_TrayMenu.Add("Controller Type", padSub)
     A_TrayMenu.Add()
+    A_TrayMenu.Add("Auto-switch Profile by Game", ToggleAutoProfile)
+    if (autoProfile)
+        A_TrayMenu.Check("Auto-switch Profile by Game")
+    starterSub := Menu()
+    for i, nm in StarterNames()
+        starterSub.Add(nm, CreateStarterProfile.Bind(i))
+    A_TrayMenu.Add("Create Starter Profile", starterSub)
+    A_TrayMenu.Add("Check Combos...", (*) => ShowComboCheck(true))
+    A_TrayMenu.Add("Controller Test...", ShowControllerTest)
+    A_TrayMenu.Add("Help...", ShowHelp)
+    A_TrayMenu.Add("Fire Log...", ShowFireLog)
     A_TrayMenu.Add("About...", ShowAbout)
     A_TrayMenu.Add()
     A_TrayMenu.AddStandard()
@@ -1128,9 +1434,9 @@ BuildTrayMenu() {
 
 ShowAbout(*) {
     global creatorName, aiNote
-    aboutGui := Gui("+AlwaysOnTop +ToolWindow", "About Combo ReMapper")
+    aboutGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox", "About Combo ReMapper")
     aboutGui.SetFont("s10", "Segoe UI")
-    aboutGui.Add("Text", "w400", "Combo ReMapper 8.19")
+    aboutGui.Add("Text", "w400", "Combo ReMapper 9.0")
     aboutGui.SetFont("s10 Bold", "Segoe UI")
     aboutGui.Add("Text", "w400 y+14", "About the creator")
     aboutGui.SetFont("s10 Norm", "Segoe UI")
@@ -1257,7 +1563,25 @@ MaintainYLock() {
     MouseMove(currentX, lockedYCoord, 0)
 }
 
-try Hotkey("*F6", ToggleYAxisLock, "On")
+RegisterYLockHotkey() {
+    global yLockKey, registeredYLockKey, yAxisLocked
+    if (registeredYLockKey != "") {
+        try Hotkey("*" registeredYLockKey, "Off")
+        registeredYLockKey := ""
+    }
+    if (yLockKey = "") {
+        ; Feature switched off: never leave the mouse stuck on a locked line
+        if (yAxisLocked)
+            ToggleYAxisLock()
+        return
+    }
+    try {
+        Hotkey("*" yLockKey, ToggleYAxisLock, "On")
+        registeredYLockKey := yLockKey
+    } catch {
+        MsgBox("Failed to bind Y-axis lock key: " . yLockKey, "Combo ReMapper 9.0", "Icon!")
+    }
+}
 
 ; ============================================================
 ; ---- Registry Helper for Auto-Start ----
@@ -1285,11 +1609,11 @@ IsAutoStartEnabled() {
 ; ---- Load & Save State ----
 ; ============================================================
 LoadState() {
-    global rows, nextRowId, scrollTriggerKey, panicKey, osdToggleKey, targetExe, configFile, currentTheme, Themes
+    global rows, nextRowId, scrollTriggerKey, panicKey, osdToggleKey, targetExe, configFile, currentTheme, Themes, yLockKey
     global keyDelayDuration, keyDelayPress, mouseDelayDuration, soundAlerts, showTooltips, showOsd, osdLocked, osdX, osdY
     global compatMode
-    global padType, padPort, padMouseStick, padScrollStick, padMouseSpeed, padMouseDead, padMouseCurve
-    global padScrollSpeed, padTrigThresh, mouseScale
+    global pressExtraMs, padPanic, padType, padPort, padMouseStick, padScrollStick, padMouseSpeed, padMouseDead, padMouseCurve
+    global padScrollSpeed, padTrigThresh, mouseScale, padSwitchCombo
     global customBgColor, customControlColor, customTextColor, controllerEnabled
 
     defaultRows := [
@@ -1311,6 +1635,9 @@ LoadState() {
 
     try panicKey := IniRead(configFile, "Meta", "PanicKey", "F8")
     try osdToggleKey := IniRead(configFile, "Meta", "OsdKey", "F7")
+    try yLockKey := IniRead(configFile, "Meta", "YLockKey", "F6")
+    if (yLockKey = "(none)")
+        yLockKey := ""
     try targetExe := IniRead(configFile, "Meta", "TargetExe", "")
     targetExe := NormalizeExe(targetExe)
 
@@ -1328,8 +1655,11 @@ LoadState() {
     try osdLocked := (IniRead(configFile, "Settings", "OsdLocked", "1") = "1")
     try osdX := Integer(IniRead(configFile, "Settings", "OsdX", 20))
     try osdY := Integer(IniRead(configFile, "Settings", "OsdY", 20))
-    try controllerEnabled := (IniRead(configFile, "Settings", "ControllerEnabled", "1") = "1")
+    try controllerEnabled := (IniRead(configFile, "Settings", "ControllerEnabled", "0") = "1")
     try padPort := Max(0, Min(4, Integer(IniRead(configFile, "Settings", "PadPort", 0))))
+    try pressExtraMs := Max(0, Min(500, Integer(IniRead(configFile, "Settings", "PressExtraMs", 0))))
+    try padPanic := (IniRead(configFile, "Settings", "PadPanic", "1") = "1")
+    try padSwitchCombo := StrUpper(Trim(IniRead(configFile, "Settings", "PadSwitchCombo", "")))
     try padType := Max(1, Min(3, Integer(IniRead(configFile, "Settings", "PadType", 1))))
     try padMouseStick := Max(0, Min(2, Integer(IniRead(configFile, "Settings", "PadMouseStick", 0))))
     try padScrollStick := Max(0, Min(2, Integer(IniRead(configFile, "Settings", "PadScrollStick", 0))))
@@ -1367,7 +1697,7 @@ LoadState() {
         if (turboMsVal <= 0)
             turboMsVal := 60
 
-        if (mode != "toggle" && mode != "press" && mode != "turbo" && mode != "taphold")
+        if (mode != "toggle" && mode != "press" && mode != "turbo" && mode != "autoturbo" && mode != "taphold" && mode != "doubletap")
             mode := "hold"
 
         rows.Push({id: i, trigger: Trim(trig), keys: ParseKeyList(combo), mode: mode, enabled: (enabledVal != "0"), turboMs: turboMsVal})
@@ -1387,6 +1717,7 @@ SaveStateToINI(targetFile) {
     IniWrite(scrollTriggerKey != "" ? scrollTriggerKey : "(none)", targetFile, "Meta", "ScrollKey")
     IniWrite(panicKey, targetFile, "Meta", "PanicKey")
     IniWrite(osdToggleKey, targetFile, "Meta", "OsdKey")
+    IniWrite(yLockKey != "" ? yLockKey : "(none)", targetFile, "Meta", "YLockKey")
     IniWrite(targetExe != "" ? targetExe : "(any)", targetFile, "Meta", "TargetExe")
     IniWrite(currentTheme, targetFile, "Meta", "Theme")
     IniWrite(Themes["Custom Image"]["img"], targetFile, "Meta", "CustomImgPath")
@@ -1403,6 +1734,9 @@ SaveStateToINI(targetFile) {
     IniWrite(osdY, targetFile, "Settings", "OsdY")
     IniWrite(controllerEnabled ? 1 : 0, targetFile, "Settings", "ControllerEnabled")
     IniWrite(padPort, targetFile, "Settings", "PadPort")
+    IniWrite(pressExtraMs, targetFile, "Settings", "PressExtraMs")
+    IniWrite(padPanic ? 1 : 0, targetFile, "Settings", "PadPanic")
+    IniWrite(padSwitchCombo, targetFile, "Settings", "PadSwitchCombo")
     IniWrite(padType, targetFile, "Settings", "PadType")
     IniWrite(padMouseStick, targetFile, "Settings", "PadMouseStick")
     IniWrite(padScrollStick, targetFile, "Settings", "PadScrollStick")
@@ -1482,7 +1816,7 @@ RegisterPanicHotkey() {
             Hotkey("*" panicKey, ToggleScript, "On")
             registeredPanicKey := panicKey
         } catch {
-            MsgBox("Failed to bind panic key: " . panicKey, "Combo ReMapper 8.19", "Icon!")
+            MsgBox("Failed to bind panic key: " . panicKey, "Combo ReMapper 9.0", "Icon!")
         }
     }
 }
@@ -1498,7 +1832,7 @@ RegisterOsdHotkey() {
             Hotkey("*" osdToggleKey, ToggleOSDOverlay, "On")
             registeredOsdKey := osdToggleKey
         } catch {
-            MsgBox("Failed to bind OSD toggle key: " . osdToggleKey, "Combo ReMapper 8.19", "Icon!")
+            MsgBox("Failed to bind OSD toggle key: " . osdToggleKey, "Combo ReMapper 9.0", "Icon!")
         }
     }
 }
@@ -1516,6 +1850,7 @@ FindRow(triggerKey) {
 ; ---- Key / Mouse action engine ----
 ; ============================================================
 ExecuteComboSequence(keysArray) {
+    global seqHeldKeys
     for k in keysArray {
         cleanKey := Trim(k)
         if (cleanKey = "")
@@ -1532,6 +1867,19 @@ ExecuteComboSequence(keysArray) {
         }
 
         lowerKey := StrLower(cleanKey)
+
+        ; down:key / up:key  -> hold a key (or mouse button) across several steps
+        if RegExMatch(cleanKey, "i)^(down|up):(\S+)$", &hm) {
+            holdName := hm[2]
+            if (StrLower(hm[1]) = "down") {
+                GameKeyDown(holdName)
+                seqHeldKeys[StrLower(holdName)] := holdName
+            } else {
+                GameKeyUp(holdName)
+                seqHeldKeys.Delete(StrLower(holdName))
+            }
+            continue
+        }
 
         ; Mouse action tokens
         if IsMouseActionToken(lowerKey) {
@@ -1570,23 +1918,71 @@ StopTurbo(triggerKey) {
 
 HandlePress(triggerKey, *) {
     global scriptEnabled, heldCombos, toggleActive, pressLatched, targetExe, turboTimers, mouseHeld
-    if (!scriptEnabled || (targetExe != "" && !WinActive("ahk_exe " . targetExe)))
+    global compatMode, seqHeldKeys
+    if (!scriptEnabled || (targetExe != "" && !WinActive("ahk_exe " . targetExe))) {
+        ignoredRow := FindRow(triggerKey)
+        if (IsObject(ignoredRow))
+            LogEvent(StrUpper(triggerKey) . "  ignored - " . (!scriptEnabled ? "script is OFF" : "target window not focused"), true)
         return
+    }
 
     row := FindRow(triggerKey)
     if (row = "" || row.keys.Length = 0)
         return
-    if (row.HasOwnProp("enabled") && !row.enabled)
+    if (row.HasOwnProp("enabled") && !row.enabled) {
+        LogEvent(StrUpper(triggerKey) . "  ignored - row is disabled", true)
         return
+    }
+
+    if (!heldCombos.Has(triggerKey) && !pressLatched.Has(triggerKey))
+        LogEvent(StrUpper(triggerKey) . "  [" . row.mode . "]  ->  " . KeyListToString(row.keys) . "   (" . StrSplit(CompatModeNames()[compatMode], " ")[1] . " mode, " . (targetExe != "" ? "target focused" : "any window") . ")")
 
     if (row.mode = "taphold") {
-        timedOut := WaitTriggerRelease(triggerKey, 250)
-        if (!timedOut && row.keys.Length >= 1) {
+        ; Tap (released within 250 ms) fires the first key; holding fires the second.
+        released := WaitTriggerRelease(triggerKey, 250)
+        if (released && row.keys.Length >= 1) {
             ExecuteComboSequence([row.keys[1]])
-            FlashOSD(triggerKey . " -> " . row.keys[1])
-        } else if (timedOut && row.keys.Length >= 2) {
+            FlashOSD(triggerKey . " tap -> " . row.keys[1])
+        } else if (!released && row.keys.Length >= 2) {
             ExecuteComboSequence([row.keys[2]])
-            FlashOSD(triggerKey . " -> " . row.keys[2])
+            FlashOSD(triggerKey . " hold -> " . row.keys[2])
+        }
+    } else if (row.mode = "doubletap") {
+        ; Two presses within 350 ms fire the combo. Key auto-repeat is ignored via pressLatched.
+        if (pressLatched.Has(triggerKey))
+            return
+        pressLatched[triggerKey] := true
+        nowTick := A_TickCount
+        lastTick := doubleTapLast.Has(triggerKey) ? doubleTapLast[triggerKey] : 0
+        if (lastTick != 0 && nowTick - lastTick <= 350) {
+            doubleTapLast[triggerKey] := 0
+            ExecuteComboSequence(row.keys)
+            FlashOSD(triggerKey . " double-tap -> " . KeyListToString(row.keys))
+        } else {
+            doubleTapLast[triggerKey] := nowTick
+        }
+    } else if (row.mode = "autoturbo") {
+        ; Press once: the combo repeats by itself. Press again: it stops.
+        if (pressLatched.Has(triggerKey))
+            return
+        pressLatched[triggerKey] := true
+        if (turboTimers.Has(triggerKey)) {
+            StopTurbo(triggerKey)
+            heldCombos.Delete(triggerKey)
+            for k in row.keys {
+                if RegExMatch(Trim(k), "i)^down:(\S+)$", &hm) {
+                    try GameKeyUp(hm[1])
+                    seqHeldKeys.Delete(StrLower(hm[1]))
+                }
+            }
+            FlashOSD(triggerKey . " AUTO OFF", "FF6666")
+        } else {
+            heldCombos[triggerKey] := true
+            turboInterval := (row.HasOwnProp("turboMs") && row.turboMs > 0) ? row.turboMs : 60
+            boundFn := FireTurbo.Bind(triggerKey)
+            turboTimers[triggerKey] := boundFn
+            SetTimer(boundFn, turboInterval)
+            FlashOSD(triggerKey . " AUTO ON (" . turboInterval . "ms)", "00FF66")
         }
     } else if (row.mode = "turbo") {
         if (heldCombos.Has(triggerKey))
@@ -1690,7 +2086,7 @@ HandleRelease(triggerKey, *) {
             SetTimer(turboTimers[triggerKey], 0)
             turboTimers.Delete(triggerKey)
         }
-    } else if (row.mode = "toggle" || row.mode = "press" || row.mode = "taphold") {
+    } else if (row.mode = "toggle" || row.mode = "press" || row.mode = "taphold" || row.mode = "doubletap" || row.mode = "autoturbo") {
         pressLatched.Delete(triggerKey)
     } else {
         ; hold mode
@@ -1745,9 +2141,10 @@ ToggleScript(*) {
 
 RegisterPanicHotkey()
 RegisterOsdHotkey()
+RegisterYLockHotkey()
 
 ReleaseAllHeldCombos() {
-    global heldCombos, toggleActive, pressLatched, turboTimers, mouseHeld
+    global heldCombos, toggleActive, pressLatched, turboTimers, mouseHeld, seqHeldKeys
 
     ; Stop all continuous mouse motion and abort any smooth-move / shake
     StopAllHoldMotion()
@@ -1774,6 +2171,12 @@ ReleaseAllHeldCombos() {
         }
     }
     heldCombos := Map()
+
+    ; Keys held by down: tokens
+    for lowName, realName in seqHeldKeys.Clone() {
+        try GameKeyUp(realName)
+    }
+    seqHeldKeys := Map()
 
     for triggerKey in toggleActive.Clone() {
         if (toggleActive[triggerKey]) {
@@ -1820,20 +2223,33 @@ FocusWatch() {
 ; ============================================================
 ExportProfile(*) {
     global rows, targetExe, panicKey, currentProfile
+    global compatMode, padType, padPort, padMouseStick, padScrollStick, padMouseSpeed, padMouseDead, padMouseCurve
+    global padScrollSpeed, padTrigThresh, mouseScale, keyDelayDuration, keyDelayPress, mouseDelayDuration
+    global pressExtraMs, padPanic
     SyncBoxesToRows()
 
-    outStr := "[REMAPPER_v8.19|NAME:" . currentProfile . "|EXE:" . targetExe . "|PANIC:" . panicKey . "]`n"
+    outStr := "[REMAPPER_v8.24|NAME:" . currentProfile . "|EXE:" . targetExe . "|PANIC:" . panicKey . "]`n"
     for row in rows {
-        if (row.trigger != "")
-            outStr .= row.trigger . ">" . KeyListToString(row.keys) . ">" . row.mode . ";"
+        if (row.trigger != "") {
+            turboVal := row.HasOwnProp("turboMs") ? row.turboMs : 60
+            enabledVal := (row.HasOwnProp("enabled") && !row.enabled) ? 0 : 1
+            outStr .= row.trigger . ">" . KeyListToString(row.keys) . ">" . row.mode . ">" . turboVal . ">" . enabledVal . ";"
+        }
     }
+    ; Settings travel last, so older versions skip them as an unreadable row
+    outStr .= "[SETTINGS|COMPAT:" . compatMode . "|PADTYPE:" . padType . "|PADPORT:" . padPort
+        . "|STICK:" . padMouseStick . "|SSTICK:" . padScrollStick . "|SPEED:" . padMouseSpeed
+        . "|DEAD:" . padMouseDead . "|CURVE:" . padMouseCurve . "|SSPEED:" . padScrollSpeed
+        . "|TRIG:" . padTrigThresh . "|MSCALE:" . mouseScale . "|KD:" . keyDelayDuration
+        . "|KP:" . keyDelayPress . "|MD:" . mouseDelayDuration . "|PEXTRA:" . pressExtraMs
+        . "|PPANIC:" . (padPanic ? 1 : 0) . "|PCOMBO:" . padSwitchCombo . "]"
 
     A_Clipboard := outStr
     NotifyUser("Profile '" . currentProfile . "' copied to clipboard!")
 }
 
 ImportProfile(*) {
-    global profileDD, profilesDir
+    global profileDD, profilesDir, currentProfile, configFile
     clipText := Trim(A_Clipboard)
 
     if (!RegExMatch(clipText, "^\[REMAPPER_v.*\|NAME:([^\|]+)\|EXE:([^\|]*)\|PANIC:([^\]]+)\]", &match)) {
@@ -1848,6 +2264,17 @@ ImportProfile(*) {
     body := SubStr(clipText, InStr(clipText, "`n") + 1)
     targetPath := profilesDir "\" pName ".ini"
 
+    ; Optional settings block (v8.24+): input mode, controller type, stick/mouse tuning, delays
+    settingsMap := Map()
+    if RegExMatch(body, "\[SETTINGS\|([^\]]*)\]", &setMatch) {
+        for pair in StrSplit(setMatch[1], "|") {
+            kv := StrSplit(pair, ":", , 2)
+            if (kv.Length = 2)
+                settingsMap[kv[1]] := kv[2]
+        }
+        body := StrReplace(body, setMatch[0], "")
+    }
+
     try FileDelete(targetPath)
     rowItems := StrSplit(body, ";")
     validRows := 0
@@ -1860,7 +2287,19 @@ ImportProfile(*) {
             IniWrite(parts[1], targetPath, "Row" . validRows, "Trigger")
             IniWrite(parts[2], targetPath, "Row" . validRows, "Combo")
             IniWrite(parts[3], targetPath, "Row" . validRows, "Mode")
+            if (parts.Length >= 5) {
+                IniWrite(parts[4], targetPath, "Row" . validRows, "TurboMs")
+                IniWrite(parts[5], targetPath, "Row" . validRows, "Enabled")
+            }
         }
+    }
+    iniKeys := Map("COMPAT", "CompatMode", "PADTYPE", "PadType", "PADPORT", "PadPort", "STICK", "PadMouseStick"
+        , "SSTICK", "PadScrollStick", "SPEED", "PadMouseSpeed", "DEAD", "PadMouseDead", "CURVE", "PadMouseCurve"
+        , "SSPEED", "PadScrollSpeed", "TRIG", "PadTrigThresh", "MSCALE", "MouseScale", "KD", "KeyDelayDuration"
+        , "KP", "KeyDelayPress", "MD", "MouseDelayDuration", "PEXTRA", "PressExtraMs", "PPANIC", "PadPanic", "PCOMBO", "PadSwitchCombo")
+    for code, iniName in iniKeys {
+        if settingsMap.Has(code)
+            IniWrite(settingsMap[code], targetPath, "Settings", iniName)
     }
     IniWrite(validRows, targetPath, "Meta", "RowCount")
     IniWrite(pPanic, targetPath, "Meta", "PanicKey")
@@ -1871,6 +2310,11 @@ ImportProfile(*) {
     profileDD.Add(GetProfileList())
     profileDD.Choose(pName)
     profileDD.OnEvent("Change", SwitchProfile, 1)
+
+    ; Importing over the profile that is open right now: stop SwitchProfile from
+    ; saving the old in-memory state on top of the file we just wrote.
+    if (StrLower(pName) = StrLower(currentProfile))
+        configFile := ""
 
     SwitchProfile(profileDD)
     NotifyUser("Imported & Switched to profile '" . pName . "'!")
@@ -1939,6 +2383,7 @@ StartKeyRecorder(slotIdx, *) {
     joyPrev := Map()
     povPrev := ""
     xiRecPrev := Map()
+    jsRecPrev := Map()
 
     JoyCaptureTick() {
         if (!controllerEnabled)
@@ -1989,6 +2434,19 @@ StartKeyRecorder(slotIdx, *) {
             }
             povPrev := povName
         }
+        curStick := JoyStickTokens()
+        for tok, v in curStick {
+            if (!jsRecPrev.Has(tok)) {
+                tLower := StrLower(tok)
+                if (tLower != targetTrigger && !recordedKeys.Has(tLower)) {
+                    recordedKeys[tLower] := true
+                    keyList.Push(tLower)
+                    targetCB.Text := JoinArray(keyList, ",")
+                    UpdateOSD("CAPTURED: " . StrUpper(tLower), "00FFFF")
+                }
+            }
+        }
+        jsRecPrev := curStick
     }
 
     SetTimer(JoyCaptureTick, 15)
@@ -2030,7 +2488,7 @@ BuildGUI() {
     global myGui, rowUI, rowSlider, scrollLabel, panicKeyBox, scrollKeyBox, targetExeBox, applyBtn, toggleBtn, statusBadge, statusText, scrollUpBtn, scrollDownBtn
     global profileDD, themeDD, bgPicControl, textControls, VISIBLE_ROWS, panicKey, scrollTriggerKey, targetExe, scriptEnabled, currentProfile, currentTheme
 
-    myGui := Gui("+Resize", "Combo ReMapper 8.19")
+    myGui := Gui("+Resize -MaximizeBox", "Combo ReMapper 9.0")
     myGui.SetFont("s10")
     myGui.OnEvent("Close", (*) => ExitApp())
 
@@ -2083,7 +2541,7 @@ BuildGUI() {
         enChk := myGui.Add("Checkbox", "x+3 yp+2 w16 h16 Checked", "")
         cb := myGui.Add("Edit", "x+3 yp-2 w131")
         autoBtn := myGui.Add("Button", "x+5 yp w42 h22", "Auto")
-        dd := myGui.Add("DropDownList", "x+5 yp w75", ["Hold", "Toggle", "Press", "Turbo", "TapHold"])
+        dd := myGui.Add("DropDownList", "x+5 yp w75", ["Hold", "Toggle", "Press", "Turbo", "TapHold", "DblTap", "TglTurbo"])
         optsBtn := myGui.Add("Button", "x+2 yp w24 h22", "...")
         remBtn := myGui.Add("Button", "x+2 yp w45 h22", "Rem")
 
@@ -2145,6 +2603,509 @@ BuildGUI() {
 }
 
 ; ---- Settings Panel Modal ----
+; ---- AUTO PROFILE BLOCK BEGIN ----
+GotoProfile(name) {
+    ; Switches to a profile by name (rebuilds the dropdown first so new profiles are listed).
+    global profileDD
+    try {
+        profileDD.OnEvent("Change", SwitchProfile, -1)
+        profileDD.Delete()
+        profileDD.Add(GetProfileList())
+        profileDD.Choose(name)
+        profileDD.OnEvent("Change", SwitchProfile, 1)
+        SwitchProfile(profileDD)
+        return true
+    } catch as err {
+        LogEvent("* Could not switch to profile '" . name . "': " . err.Message)
+        return false
+    }
+}
+
+AutoProfileTick() {
+    ; Switches to the profile whose Target EXE matches the window in front.
+    ; Does nothing when no profile matches, so alt-tabbing to the desktop keeps your profile.
+    global autoProfile, autoProfLastExe, profilesDir, profileDD, targetExe, currentProfile
+    if (!autoProfile)
+        return
+    exe := ""
+    try exe := WinGetProcessName("A")
+    if (exe = "" || exe = autoProfLastExe)
+        return
+    autoProfLastExe := exe
+    ownExe := ""
+    SplitPath(A_IsCompiled ? A_ScriptFullPath : A_AhkPath, &ownExe)
+    if (StrLower(exe) = StrLower(ownExe))
+        return
+    curExe := NormalizeExe(targetExe)
+    if (curExe != "" && StrLower(curExe) = StrLower(exe))
+        return
+    for name in GetProfileList() {
+        tExe := ""
+        try tExe := NormalizeExe(IniRead(profilesDir "\" name ".ini", "Meta", "TargetExe", "(any)"))
+        if (tExe != "" && StrLower(tExe) = StrLower(exe)) {
+            if (name = currentProfile)
+                return
+            if GotoProfile(name)
+                NotifyUser("Auto-switched to profile '" . name . "' for " . exe)
+            return
+        }
+    }
+}
+
+ToggleAutoProfile(*) {
+    global autoProfile, autoProfLastExe, globalSettingsFile
+    autoProfile := !autoProfile
+    autoProfLastExe := ""
+    try IniWrite(autoProfile ? 1 : 0, globalSettingsFile, "Global", "AutoProfile")
+    BuildTrayMenu()
+    NotifyUser("Auto-switch profile by game: " . (autoProfile ? "ON" : "OFF"))
+}
+; ---- AUTO PROFILE BLOCK END ----
+
+; ---- COMBO CHECK BLOCK BEGIN ----
+IsValidKeyName(name) {
+    n := Trim(name)
+    if (n = "")
+        return false
+    low := StrLower(n)
+    if (low = "wheelup" || low = "wheeldown" || low = "wheelleft" || low = "wheelright")
+        return true
+    return GetKeyName(n) != ""
+}
+
+IsValidTrigger(trig) {
+    t := RegExReplace(Trim(trig), "^[~*$]+")
+    if (t = "")
+        return false
+    if InStr(t, " & ") {
+        for part in StrSplit(t, " & ") {
+            if (!IsValidKeyName(part))
+                return false
+        }
+        return true
+    }
+    if (IsJoyTrigger(t))
+        return true
+    return IsValidKeyName(t)
+}
+
+ValidateRows() {
+    ; Looks for mistakes. Duplicate triggers are already blocked when you press Apply.
+    global rows
+    warnings := []
+    for i, row in rows {
+        trig := Trim(row.trigger)
+        if (trig = "" || (row.HasOwnProp("enabled") && !row.enabled))
+            continue
+        label := "Row " . i . " (" . trig . ")"
+        if (!IsValidTrigger(trig))
+            warnings.Push(label . ": '" . trig . "' is not a key, mouse button or controller button name")
+        if (row.keys.Length = 0) {
+            warnings.Push(label . ": no keys to send")
+            continue
+        }
+        if (row.mode = "taphold" && row.keys.Length < 2)
+            warnings.Push(label . ": TapHold needs two keys (first = tap, second = hold)")
+        for k in row.keys {
+            tok := Trim(k)
+            if (tok = "")
+                continue
+            low := StrLower(tok)
+            if (IsPauseToken(tok))
+                continue
+            if (IsJoyTrigger(tok)) {
+                warnings.Push(label . ": '" . tok . "' is a controller button and cannot be sent as output")
+                continue
+            }
+            if RegExMatch(tok, "i)^(down|up):(\S+)$", &hm) {
+                if (!IsValidKeyName(hm[2]))
+                    warnings.Push(label . ": unknown key name '" . hm[2] . "' in '" . tok . "'")
+                if (row.mode = "hold" || row.mode = "toggle")
+                    warnings.Push(label . ": '" . tok . "' does nothing in Hold or Toggle rows (use Press, Turbo or TglTurbo)")
+                continue
+            }
+            if (IsMouseActionToken(low)) {
+                if (IsHoldMotionToken(low) && row.mode != "hold" && row.mode != "toggle")
+                    warnings.Push(label . ": '" . tok . "' only works in Hold or Toggle rows")
+                continue
+            }
+            if (!IsValidKeyName(tok))
+                warnings.Push(label . ": unknown key name '" . tok . "'")
+        }
+    }
+    return warnings
+}
+
+ShowComboCheck(always := false) {
+    SyncBoxesToRows()
+    warnings := ValidateRows()
+    if (warnings.Length = 0) {
+        if (always)
+            MsgBox("No problems found in your combos.", "Combo check", "Iconi")
+        return
+    }
+    text := ""
+    for i, w in warnings {
+        LogEvent("* check: " . w)
+        if (i <= 14)
+            text .= "- " . w . "`n"
+    }
+    if (warnings.Length > 14)
+        text .= "...and " . (warnings.Length - 14) . " more (see the Fire Log).`n"
+    MsgBox("Possible problems in your combos:`n`n" . text, "Combo check", "Icon!")
+}
+; ---- COMBO CHECK BLOCK END ----
+
+; ---- HOVER TIPS BLOCK BEGIN ----
+AddTip(ctrl, text) {
+    global tipMap
+    tipMap[ctrl.Hwnd] := text
+}
+
+StartTips(winHwnd) {
+    global tipWinHwnd, tipLast
+    tipWinHwnd := winHwnd
+    tipLast := ""
+    SetTimer(TipTick, 150)
+}
+
+TipTick() {
+    global tipMap, tipLast, tipWinHwnd
+    if (!WinExist("ahk_id " . tipWinHwnd)) {
+        SetTimer(TipTick, 0)
+        ToolTip(, , , 5)
+        tipLast := ""
+        return
+    }
+    MouseGetPos(, , &overWin, &overCtrl, 2)
+    txt := ""
+    if (tipMap.Has(overCtrl))
+        txt := tipMap[overCtrl]
+    if (txt != tipLast) {
+        tipLast := txt
+        ToolTip(txt, , , 5)
+    }
+}
+; ---- HOVER TIPS BLOCK END ----
+
+; ---- CONTROLLER TEST BLOCK BEGIN ----
+global ctGui := 0
+global ctEdit := 0
+
+ShowControllerTest(*) {
+    global ctGui, ctEdit
+    if (IsObject(ctGui)) {
+        ctGui.Show("NoActivate")
+        return
+    }
+    ctGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox +E0x08000000", "Controller Test")
+    ctGui.SetFont("s10", "Consolas")
+    ctEdit := ctGui.Add("Edit", "x8 y8 w430 h290 ReadOnly -Wrap", "")
+    ctGui.OnEvent("Close", CloseControllerTest)
+    ctGui.Show("w446 h306 NoActivate")
+    SetTimer(ControllerTestTick, 80)
+}
+
+CloseControllerTest(*) {
+    global ctGui, ctEdit
+    SetTimer(ControllerTestTick, 0)
+    try ctGui.Destroy()
+    ctGui := 0
+    ctEdit := 0
+}
+
+ControllerTestTick() {
+    ; Live view of what Windows reports, independent of rows and profiles.
+    global ctGui, ctEdit, joyId
+    if (!IsObject(ctGui)) {
+        SetTimer(ControllerTestTick, 0)
+        return
+    }
+    t := "PS4 / generic pad (DirectInput)`n"
+    if (!JoyPresent())
+        DetectJoyId()
+    if (JoyPresent()) {
+        padName := GetKeyState(joyId . "JoyName")
+        t .= "  pad: " . padName . "  (#" . joyId . ")`n"
+        t .= "  buttons down:"
+        anyDown := false
+        loop 32 {
+            if GetKeyState(joyId . "Joy" . A_Index) {
+                t .= " J" . A_Index
+                anyDown := true
+            }
+        }
+        t .= anyDown ? "`n" : " none`n"
+        pov := GetPovName()
+        t .= "  d-pad: " . (pov != "" ? pov : "centre") . "`n"
+        t .= Format("  X {:5.1f}  Y {:5.1f}  Z {:5.1f}`n  R {:5.1f}  U {:5.1f}  V {:5.1f}`n", JoyAxis("X"), JoyAxis("Y"), JoyAxis("Z"), JoyAxis("R"), JoyAxis("U"), JoyAxis("V"))
+        stickList := ""
+        for tok, v in JoyStickTokens()
+            stickList .= " " . tok
+        t .= "  stick directions:" . (stickList != "" ? stickList : " none") . "`n"
+    } else {
+        t .= "  no DirectInput pad found`n"
+    }
+    t .= "`nXbox pad (XInput)`n"
+    if (XInputPoll()) {
+        tokList := ""
+        for tok, v in XInputTokens()
+            tokList .= " " . tok
+        t .= "  slot " . (xiUser + 1) . ": pressed:" . (tokList != "" ? tokList : " none") . "`n"
+    } else {
+        t .= "  no Xbox pad found`n"
+    }
+    try ctEdit.Value := t
+}
+; ---- CONTROLLER TEST BLOCK END ----
+
+; ---- HELP BLOCK BEGIN ----
+HelpText() {
+    t := ""
+    t .= "COMBO REMAPPER - QUICK HELP" . "`n"
+    t .= "============================" . "`n"
+    t .= "" . "`n"
+    t .= "WHAT IT DOES" . "`n"
+    t .= "Each row is: TRIGGER -> COMBO, with a MODE. When you press the trigger" . "`n"
+    t .= "(keyboard key, mouse button, or controller button), the remapper sends the" . "`n"
+    t .= "combo to the game. It only reacts while the Target EXE window is in front" . "`n"
+    t .= "(leave Target EXE on `"(any)`" to react everywhere)." . "`n"
+    t .= "" . "`n"
+    t .= "TRIGGERS" . "`n"
+    t .= "  Keyboard / mouse    F1, q, XButton1, WheelUp ... any AutoHotkey key name" . "`n"
+    t .= "  DualShock 4 (J)     J1 Square, J2 Cross, J3 Circle, J4 Triangle," . "`n"
+    t .= "                      J5 L1, J6 R1, J7 L2, J8 R2, J9 Share, J10 Options," . "`n"
+    t .= "                      J11 L3, J12 R3, J13 PS, J14 Touchpad" . "`n"
+    t .= "                      (numbers can differ - use the Auto recorder to be sure)" . "`n"
+    t .= "  D-pad               JPOVU  JPOVD  JPOVL  JPOVR" . "`n"
+    t .= "  Stick directions    JLSU JLSD JLSL JLSR (left)  JRSU JRSD JRSL JRSR (right)" . "`n"
+    t .= "  Xbox pad (X)        XA XB XX XY XLB XRB XLT XRT XSTART XBACK XLS XRS" . "`n"
+    t .= "                      XUP XDOWN XLEFT XRIGHT, sticks XLSU.. and XRSU.." . "`n"
+    t .= "  Chords              J5+J6   XLB+XRB   (all buttons held together)" . "`n"
+    t .= "" . "`n"
+    t .= "MODES" . "`n"
+    t .= "  Hold      Sends the keys while the trigger is held, releases on release." . "`n"
+    t .= "  Toggle    Press once to hold the keys down, press again to let go (auto-hold)." . "`n"
+    t .= "  Press     One quick press of the combo each time." . "`n"
+    t .= "  Turbo     Repeats the combo quickly while held (right-click row: interval)." . "`n"
+    t .= "  TapHold   A quick tap sends the FIRST key, holding sends the SECOND key." . "`n"
+    t .= "  DblTap    Two quick presses (within 0.35 s) send the combo." . "`n"
+    t .= "  TglTurbo  Press once: the combo repeats by itself. Press again: it stops." . "`n"
+    t .= "            (right-click row: interval)" . "`n"
+    t .= "" . "`n"
+    t .= "COMBO WORDS (separate with commas)" . "`n"
+    t .= "  w, shift, space, f5     keys by name" . "`n"
+    t .= "  d150  or  150           wait 150 milliseconds (a single digit is a real key)" . "`n"
+    t .= "  mlc mrc mmc             left / right / middle click" . "`n"
+    t .= "  mdown  mup              hold / release the left button" . "`n"
+    t .= "  mwd5   mwu5             scroll down / up 5 notches" . "`n"
+    t .= "  m10,-5                  move the mouse 10 right, 5 up (relative)" . "`n"
+    t .= "  mx400,300               move the mouse to screen position 400,300" . "`n"
+    t .= "  mm200,0,500             smooth move: 200 px right over 500 ms" . "`n"
+    t .= "  mshake12,600            camera shake up to 12 px for 600 ms" . "`n"
+    t .= "  mwave0,30,600,15        waggle up/down 30 px every 15 ms for 600 ms" . "`n"
+    t .= "  down:q  up:q           hold a key (or lbutton) across steps, then let go" . "`n"
+    t .= "                         e.g.  down:q,d40,mlc,d40,up:q" . "`n"
+    t .= "  mh300,0                 steady move 300 px/s while a Hold row is held or a" . "`n"
+    t .= "                          Toggle row is on" . "`n"
+    t .= "" . "`n"
+    t .= "SETTINGS (tray icon > Settings)" . "`n"
+    t .= "  Input mode              Game / Classic / Hybrid. If a game ignores the keys," . "`n"
+    t .= "                          try another mode (also in the tray menu)." . "`n"
+    t .= "  Extra press time        Adds milliseconds to every key press. Helps with" . "`n"
+    t .= "                          timed prompts and games that miss short taps." . "`n"
+    t .= "  Controller type         Auto, Xbox (XInput) or PS4 (DirectInput)." . "`n"
+    t .= "  Mouse stick / Scroll    A stick moves the mouse or scrolls the wheel." . "`n"
+    t .= "  Speed, Deadzone, Curve  Tune the stick. A higher curve = finer control" . "`n"
+    t .= "                          near the centre." . "`n"
+    t .= "  Mouse speed %           Scales m / mm / mshake / mh moves." . "`n"
+    t .= "  Run as Administrator    Needed when the game runs as admin. Restart to apply." . "`n"
+    t .= "  Auto-switch profile     Changes profile by itself when you switch to a game" . "`n"
+    t .= "                          whose profile has that Target EXE." . "`n"
+    t .= "" . "`n"
+    t .= "TRAY MENU EXTRAS" . "`n"
+    t .= "  Fire Log                Shows what fired and why something did not." . "`n"
+    t .= "  Controller Test         Live view of every button, d-pad and stick Windows sees." . "`n"
+    t .= "  Check Combos            Looks for typos and mistakes in your rows." . "`n"
+    t .= "  Create Starter Profile  Ready-made profiles to change to your liking." . "`n"
+    t .= "  Compatibility / Controller Type   Quick switches." . "`n"
+    t .= "" . "`n"
+    t .= "PANIC" . "`n"
+    t .= "  Keyboard: the panic key (default F8) turns the remapper off or on." . "`n"
+    t .= "  Controller: hold Start+Back (Xbox) or Share+Options (PS4) for 1 second" . "`n"
+    t .= "  to turn it off - hold it again to turn it back on. You can set your own" . "`n"
+    t .= "  buttons in Settings (On/Off buttons). Held keys are always released." . "`n"
+    t .= "" . "`n"
+    t .= "TIPS" . "`n"
+    t .= "  * Right-click a row for tools: Test Fire, Turbo interval, insert mouse" . "`n"
+    t .= "    actions, duplicate, clear." . "`n"
+    t .= "  * Hover over a setting in the Settings window for a short explanation." . "`n"
+    t .= "  * Export Profile copies a profile to the clipboard; Import brings it back," . "`n"
+    t .= "    including input mode, controller and mouse settings." . "`n"
+    return t
+}
+
+ShowHelp(*) {
+    global helpGui
+    if (IsObject(helpGui)) {
+        helpGui.Show()
+        return
+    }
+    helpGui := Gui("+Resize -MaximizeBox", "Combo ReMapper - Help")
+    helpGui.SetFont("s10", "Consolas")
+    helpEdit := helpGui.Add("Edit", "x8 y8 w660 h520 ReadOnly -Wrap +VScroll +HScroll vHelpEdit", HelpText())
+    helpGui.OnEvent("Size", HelpResize)
+    helpGui.OnEvent("Close", HelpClose)
+    helpGui.Show("w676 h536")
+}
+
+HelpResize(g, minMax, w, h) {
+    if (minMax = -1)
+        return
+    g["HelpEdit"].Move(, , Max(100, w - 16), Max(100, h - 16))
+}
+
+HelpClose(*) {
+    global helpGui
+    try helpGui.Destroy()
+    helpGui := 0
+}
+; ---- HELP BLOCK END ----
+
+; ---- STARTER PROFILES BLOCK BEGIN ----
+StarterNames() {
+    return ["PS4 pad to keyboard + mouse", "Xbox pad to keyboard + mouse", "Auto-walk and auto-fire", "Quick-time mash"]
+}
+
+StarterData(idx) {
+    ; Returns Map with name, padType, stick and rows [[trigger, combo, mode, turboMs], ...]
+    if (idx = 1) {
+        return Map("name", "starter_ps4_keyboard", "padType", 3, "stick", 2, "rows", [
+            ["JPOVU", "w", "hold", 60], ["JPOVD", "s", "hold", 60], ["JPOVL", "a", "hold", 60], ["JPOVR", "d", "hold", 60],
+            ["J2", "space", "hold", 60], ["J3", "e", "press", 60], ["J1", "r", "press", 60], ["J4", "f", "press", 60],
+            ["J5", "lshift", "hold", 60], ["J6", "lctrl", "hold", 60], ["J8", "lbutton", "hold", 60], ["J7", "rbutton", "hold", 60],
+            ["J10", "escape", "press", 60], ["J9", "tab", "press", 60]])
+    }
+    if (idx = 2) {
+        return Map("name", "starter_xbox_keyboard", "padType", 2, "stick", 2, "rows", [
+            ["XUP", "w", "hold", 60], ["XDOWN", "s", "hold", 60], ["XLEFT", "a", "hold", 60], ["XRIGHT", "d", "hold", 60],
+            ["XA", "space", "hold", 60], ["XY", "e", "press", 60], ["XX", "r", "press", 60], ["XB", "lctrl", "hold", 60],
+            ["XLB", "lshift", "hold", 60], ["XRB", "f", "press", 60], ["XRT", "lbutton", "hold", 60], ["XLT", "rbutton", "hold", 60],
+            ["XSTART", "escape", "press", 60], ["XBACK", "tab", "press", 60]])
+    }
+    if (idx = 3) {
+        return Map("name", "starter_auto_walk_fire", "padType", 1, "stick", 0, "rows", [
+            ["F1", "w", "toggle", 60], ["F2", "shift,w", "toggle", 60], ["F3", "lbutton", "toggle", 60],
+            ["F4", "mlc", "turbo", 60]])
+    }
+    return Map("name", "starter_quick_time_mash", "padType", 1, "stick", 0, "rows", [
+        ["F1", "e", "turbo", 40], ["F2", "space", "turbo", 50], ["F3", "mlc", "turbo", 80],
+        ["F4", "e,d80,e,d80,e", "press", 60]])
+}
+
+CreateStarterProfile(idx, *) {
+    global profilesDir
+    data := StarterData(idx)
+    name := data["name"]
+    path := profilesDir "\" name ".ini"
+    if !FileExist(path) {
+        DirCreate(profilesDir)
+        IniWrite(data["rows"].Length, path, "Meta", "RowCount")
+        IniWrite("(none)", path, "Meta", "ScrollKey")
+        IniWrite(data.Has("panic") ? data["panic"] : "F8", path, "Meta", "PanicKey")
+        IniWrite(data.Has("exe") ? data["exe"] : "(any)", path, "Meta", "TargetExe")
+        if (data.Has("exe")) {
+            ; Game profiles: Game input mode (scan codes + raw mouse), beeps on, chosen press time
+            IniWrite(1, path, "Settings", "CompatMode")
+            IniWrite(1, path, "Settings", "SoundAlerts")
+            IniWrite(data["extra"], path, "Settings", "PressExtraMs")
+        }
+        IniWrite(1, path, "Settings", "ControllerEnabled")
+        IniWrite(data["padType"], path, "Settings", "PadType")
+        IniWrite(data["stick"], path, "Settings", "PadMouseStick")
+        for i, r in data["rows"] {
+            IniWrite(r[1], path, "Row" . i, "Trigger")
+            IniWrite(r[2], path, "Row" . i, "Combo")
+            IniWrite(r[3], path, "Row" . i, "Mode")
+            IniWrite(r.Length >= 5 ? r[5] : 1, path, "Row" . i, "Enabled")
+            IniWrite(r[4], path, "Row" . i, "TurboMs")
+        }
+    }
+    GotoProfile(name)
+    NotifyUser("Starter profile ready: " . name . (data.Has("exe") ? "  (target: " . data["exe"] . " - change it if your game shows another name)" : "  (set your Target EXE, then Apply)"))
+}
+; ---- STARTER PROFILES BLOCK END ----
+
+; ---- FIRE LOG BLOCK BEGIN ----
+LogEvent(msg, throttle := false) {
+    global fireLog, logLV, logLastMsg, logLastTick
+    if (throttle && msg = logLastMsg && A_TickCount - logLastTick < 400)
+        return
+    logLastMsg := msg
+    logLastTick := A_TickCount
+    stamp := FormatTime(, "HH:mm:ss") . "." . Format("{:03}", A_MSec)
+    fireLog.Push([stamp, msg])
+    if (fireLog.Length > 300)
+        fireLog.RemoveAt(1)
+    if (IsObject(logLV)) {
+        try {
+            logLV.Add("", stamp, msg)
+            if (logLV.GetCount() > 300)
+                logLV.Delete(1)
+            logLV.Modify(logLV.GetCount(), "Vis")
+        }
+    }
+}
+
+ShowFireLog(*) {
+    global logGui, logLV, fireLog, logClearBtn, logCloseBtn
+    if (IsObject(logGui)) {
+        logGui.Show("NoActivate")
+        return
+    }
+    ; Never takes focus, so it does not disturb the game while you watch it
+    logGui := Gui("+AlwaysOnTop +ToolWindow +Resize -MaximizeBox +E0x08000000", "Remapper Fire Log")
+    logGui.SetFont("s9", "Segoe UI")
+    logLV := logGui.Add("ListView", "x8 y8 w560 h250 -Multi Grid", ["Time", "Event"])
+    logLV.ModifyCol(1, 90)
+    logLV.ModifyCol(2, 450)
+    for entry in fireLog
+        logLV.Add("", entry[1], entry[2])
+    logClearBtn := logGui.Add("Button", "x8 y266 w90 h28", "Clear")
+    logCloseBtn := logGui.Add("Button", "x106 y266 w90 h28", "Close")
+    logClearBtn.OnEvent("Click", ClearFireLog)
+    logCloseBtn.OnEvent("Click", CloseFireLog)
+    logGui.OnEvent("Close", CloseFireLog)
+    logGui.OnEvent("Size", ResizeFireLog)
+    logGui.Show("w576 h304 NoActivate")
+    if (logLV.GetCount() > 0)
+        logLV.Modify(logLV.GetCount(), "Vis")
+}
+
+ResizeFireLog(g, minMax, w, h) {
+    global logLV, logClearBtn, logCloseBtn
+    if (minMax = -1 || !IsObject(logLV))
+        return
+    logLV.Move(, , Max(100, w - 16), Max(60, h - 54))
+    logClearBtn.Move(, h - 38)
+    logCloseBtn.Move(, h - 38)
+}
+
+ClearFireLog(*) {
+    global fireLog, logLV
+    fireLog := []
+    if (IsObject(logLV))
+        logLV.Delete()
+}
+
+CloseFireLog(*) {
+    global logGui, logLV
+    try logGui.Destroy()
+    logGui := 0
+    logLV := 0
+}
+; ---- FIRE LOG BLOCK END ----
+
 ; ---- SCROLLABLE GUI BLOCK BEGIN ----
 ; Adds a vertical scroll bar (and mouse-wheel scrolling) to any Gui, so panels can keep growing.
 global scrollGuis := Map()          ; top-level hwnd -> Map("contentH", total height, "pos", scroll offset)
@@ -2258,79 +3219,144 @@ OpenSettingsPanel(*) {
     global customBgColor, customControlColor, customTextColor, configFile, myGui, currentTheme
     global controllerEnabled, controllerPollMs, compatMode, runAsAdmin
 
-    settingsGui := Gui("+Owner" . myGui.Hwnd . " +ToolWindow +Resize +0x200000", "Remapper Settings Panel")
+    settingsGui := Gui("+Owner" . myGui.Hwnd . " +ToolWindow +Resize -MaximizeBox +0x200000", "Remapper Settings Panel")
     settingsGui.SetFont("s9")
 
-    settingsGui.Add("GroupBox", "xm ym w340 h115", "Engine Delay & Speed (ms)")
-    settingsGui.Add("Text", "x20 yp+28 w120", "Key Delay:")
-    kdEdit := settingsGui.Add("Edit", "x150 yp-3 w60", keyDelayDuration)
-
-    settingsGui.Add("Text", "x20 y+12 w120", "Press Duration:")
-    kpEdit := settingsGui.Add("Edit", "x150 yp-3 w60", keyDelayPress)
-
-    settingsGui.Add("Text", "x20 y+12 w120", "Mouse Delay:")
-    mdEdit := settingsGui.Add("Edit", "x150 yp-3 w60", mouseDelayDuration)
-
-    settingsGui.Add("GroupBox", "xm y+20 w340 h195", "System, OSD, Controller & Notifications")
+    ; ---------------- Main settings window: everyday options ----------------
+    settingsGui.Add("GroupBox", "xm ym w340 h258", "Startup, display and input")
     autoStartCB := settingsGui.Add("Checkbox", "x20 yp+25 " . (IsAutoStartEnabled() ? "Checked" : ""), "Auto-Start with Windows Startup")
     soundCB := settingsGui.Add("Checkbox", "x20 y+8 " . (soundAlerts ? "Checked" : ""), "Enable Audio Beep Alerts")
     tooltipCB := settingsGui.Add("Checkbox", "x20 y+8 " . (showTooltips ? "Checked" : ""), "Enable Overlay ToolTips")
     osdCB := settingsGui.Add("Checkbox", "x20 y+8 " . (showOsd ? "Checked" : ""), "Enable On-Screen Overlay (OSD)")
     osdLockCB := settingsGui.Add("Checkbox", "x20 y+8 " . (osdLocked ? "Checked" : ""), "Lock OSD Position (Click-Through)")
-    controllerCB := settingsGui.Add("Checkbox", "x20 y+8 " . (controllerEnabled ? "Checked" : ""), "Enable Gamepad / Controller Support")
-
-    settingsGui.Add("Text", "x20 y+10 w110", "OSD Toggle Key:")
+    settingsGui.Add("Text", "x20 y+12 w110", "OSD Toggle Key:")
     osdKeyBox := settingsGui.Add("Edit", "x130 yp-3 w60", osdToggleKey)
     osdCapBtn := settingsGui.Add("Button", "x+5 yp w45 h22", "Bind")
     osdCapBtn.OnEvent("Click", (*) => CaptureSingleKey(osdKeyBox))
-
-    settingsGui.Add("GroupBox", "xm y+20 w340 h100", "Compatibility")
-    settingsGui.Add("Text", "x20 yp+26 w80", "Input mode:")
+    settingsGui.Add("Text", "x20 y+16 w80", "Input mode:")
     compatDD := settingsGui.Add("DropDownList", "x105 yp-3 w240 AltSubmit Choose" . compatMode, CompatModeNames())
-    adminCB := settingsGui.Add("Checkbox", "x20 y+12 " . (runAsAdmin ? "Checked" : ""), "Run as Administrator (applies after restart)")
+    autoProfCB := settingsGui.Add("Checkbox", "x20 y+12 " . (autoProfile ? "Checked" : ""), "Auto-switch profile by game window")
+    controllerCB := settingsGui.Add("Checkbox", "x20 y+8 " . (controllerEnabled ? "Checked" : ""), "Enable Gamepad / Controller Support")
 
-    settingsGui.Add("GroupBox", "xm y+20 w340 h230", "Controller and Mouse")
-    settingsGui.Add("Text", "x20 yp+26 w90", "Controller type:")
-    padTypeDD := settingsGui.Add("DropDownList", "x115 yp-3 w205 AltSubmit Choose" . padType, PadTypeNames())
-    settingsGui.Add("Text", "x20 y+12 w70", "Pad slot:")
-    padDD := settingsGui.Add("DropDownList", "x95 yp-3 w95 AltSubmit Choose" . (padPort + 1), ["Auto", "Pad 1", "Pad 2", "Pad 3", "Pad 4"])
-    settingsGui.Add("Text", "x200 yp+3 w70", "Trigger at:")
-    trigEdit := settingsGui.Add("Edit", "x272 yp-3 w50", padTrigThresh)
+    settingsGui.Add("GroupBox", "xm y+20 w340 h100", "Mouse hotkeys (tick Off to disable)")
+    settingsGui.Add("Text", "x20 yp+26 w110", "Scroll-click key:")
+    scrollKeyEdit := settingsGui.Add("Edit", "x135 yp-3 w60", scrollTriggerKey)
+    scrollKeyBind := settingsGui.Add("Button", "x+5 yp w45 h22", "Bind")
+    scrollKeyBind.OnEvent("Click", (*) => CaptureSingleKey(scrollKeyEdit))
+    scrollOffCB := settingsGui.Add("Checkbox", "x+10 yp+3 " . (scrollTriggerKey = "" ? "Checked" : ""), "Off")
+    settingsGui.Add("Text", "x20 y+14 w110", "Y-Axis Lock key:")
+    yLockEdit := settingsGui.Add("Edit", "x135 yp-3 w60", yLockKey)
+    yLockBind := settingsGui.Add("Button", "x+5 yp w45 h22", "Bind")
+    yLockBind.OnEvent("Click", (*) => CaptureSingleKey(yLockEdit))
+    yLockOffCB := settingsGui.Add("Checkbox", "x+10 yp+3 " . (yLockKey = "" ? "Checked" : ""), "Off")
 
-    settingsGui.Add("Text", "x20 y+12 w70", "Mouse stick:")
-    msDD := settingsGui.Add("DropDownList", "x95 yp-3 w95 AltSubmit Choose" . (padMouseStick + 1), ["Off", "Left stick", "Right stick"])
-    settingsGui.Add("Text", "x200 yp+3 w70", "Speed px/s:")
-    msSpeedEdit := settingsGui.Add("Edit", "x272 yp-3 w50", padMouseSpeed)
+    settingsGui.Add("GroupBox", "xm y+22 w340 h150", "Controller")
+    settingsGui.Add("Text", "x20 yp+26 w100", "Controller type:")
+    padTypeDD := settingsGui.Add("DropDownList", "x125 yp-3 w215 AltSubmit Choose" . padType, PadTypeNames())
+    settingsGui.Add("Text", "x20 y+12 w80", "Mouse stick:")
+    msDD := settingsGui.Add("DropDownList", "x105 yp-3 w95 AltSubmit Choose" . (padMouseStick + 1), ["Off", "Left stick", "Right stick"])
+    settingsGui.Add("Text", "x210 yp+3 w70", "Speed px/s:")
+    msSpeedEdit := settingsGui.Add("Edit", "x282 yp-3 w55", padMouseSpeed)
+    settingsGui.Add("Text", "x20 y+12 w80", "Scroll stick:")
+    scDD := settingsGui.Add("DropDownList", "x105 yp-3 w95 AltSubmit Choose" . (padScrollStick + 1), ["Off", "Left stick", "Right stick"])
+    settingsGui.Add("Text", "x210 yp+3 w70", "Ticks/s:")
+    scSpeedEdit := settingsGui.Add("Edit", "x282 yp-3 w55", padScrollSpeed)
+    padPanicCB := settingsGui.Add("Checkbox", "x20 y+14 " . (padPanic ? "Checked" : ""), "Hold the on/off buttons for 1 second to switch the remapper off / on")
+    settingsGui.Add("Text", "x20 y+8 w110", "On/Off buttons:")
+    padSwitchEdit := settingsGui.Add("Edit", "x135 yp-3 w135", padSwitchCombo)
+    padSwitchBtn := settingsGui.Add("Button", "x278 yp-1 w62", "Detect")
+    padSwitchBtn.OnEvent("Click", DetectPadSwitch.Bind(padSwitchEdit))
 
-    settingsGui.Add("Text", "x20 y+12 w70", "Deadzone %:")
-    msDeadEdit := settingsGui.Add("Edit", "x95 yp-3 w50", padMouseDead)
-    settingsGui.Add("Text", "x200 yp+3 w70", "Curve:")
-    msCurveEdit := settingsGui.Add("Edit", "x272 yp-3 w50", padMouseCurve)
-
-    settingsGui.Add("Text", "x20 y+12 w70", "Scroll stick:")
-    scDD := settingsGui.Add("DropDownList", "x95 yp-3 w95 AltSubmit Choose" . (padScrollStick + 1), ["Off", "Left stick", "Right stick"])
-    settingsGui.Add("Text", "x200 yp+3 w70", "Ticks/s:")
-    scSpeedEdit := settingsGui.Add("Edit", "x272 yp-3 w50", padScrollSpeed)
-
-    settingsGui.Add("Text", "x20 y+12 w100", "Mouse speed %:")
-    scaleEdit := settingsGui.Add("Edit", "x125 yp-3 w50", mouseScale)
-    settingsGui.Add("Text", "x185 yp+3 w150", "(m / mm / mshake / mh)")
-
-    settingsGui.Add("GroupBox", "xm y+20 w340 h115", "Custom RGB Theme Pickers (HEX)")
-    settingsGui.Add("Text", "x20 yp+28 w130", "Window Background:")
-    bgHexEdit := settingsGui.Add("Edit", "x150 yp-3 w70", customBgColor)
-
-    settingsGui.Add("Text", "x20 y+12 w130", "Control Background:")
-    ctrlHexEdit := settingsGui.Add("Edit", "x150 yp-3 w70", customControlColor)
-
-    settingsGui.Add("Text", "x20 y+12 w130", "Text Color:")
-    textHexEdit := settingsGui.Add("Edit", "x150 yp-3 w70", customTextColor)
-
-    aboutBtn := settingsGui.Add("Button", "xm y+20 w110 h30", "About...")
+    aboutBtn := settingsGui.Add("Button", "xm y+30 w100 h30", "About...")
     aboutBtn.OnEvent("Click", ShowAbout)
-    saveBtn := settingsGui.Add("Button", "x+10 yp w110 h30", "Save Settings")
+    logBtn := settingsGui.Add("Button", "x+8 yp w115 h30", "Fire Log...")
+    logBtn.OnEvent("Click", ShowFireLog)
+    helpBtn := settingsGui.Add("Button", "x+8 yp w100 h30", "Help...")
+    helpBtn.OnEvent("Click", ShowHelp)
+    advBtn := settingsGui.Add("Button", "xm y+8 w155 h30", "Advanced...")
+    advBtn.OnEvent("Click", (*) => ShowAdvanced())
+    saveBtn := settingsGui.Add("Button", "x+8 yp w172 h30", "Save Settings")
     saveBtn.OnEvent("Click", (*) => SaveSettingsAction())
 
+    ; ---------------- Advanced window: fine tuning (kept hidden until asked for) ----------------
+    advGui := Gui("+Owner" . settingsGui.Hwnd . " +ToolWindow +Resize -MaximizeBox +0x200000", "Advanced Settings")
+    advGui.SetFont("s9")
+    advGui.Add("GroupBox", "xm ym w340 h150", "Engine timing (ms)")
+    advGui.Add("Text", "x20 yp+28 w120", "Key Delay:")
+    kdEdit := advGui.Add("Edit", "x150 yp-3 w60", keyDelayDuration)
+    advGui.Add("Text", "x20 y+12 w120", "Press Duration:")
+    kpEdit := advGui.Add("Edit", "x150 yp-3 w60", keyDelayPress)
+    advGui.Add("Text", "x20 y+12 w120", "Mouse Delay:")
+    mdEdit := advGui.Add("Edit", "x150 yp-3 w60", mouseDelayDuration)
+    advGui.Add("Text", "x20 y+12 w120", "Extra press time:")
+    pressExtraEdit := advGui.Add("Edit", "x150 yp-3 w60 Number", pressExtraMs)
+
+    advGui.Add("GroupBox", "xm y+22 w340 h140", "Controller tuning")
+    advGui.Add("Text", "x20 yp+28 w80", "Pad slot:")
+    padDD := advGui.Add("DropDownList", "x105 yp-3 w90 AltSubmit Choose" . (padPort + 1), ["Auto", "Pad 1", "Pad 2", "Pad 3", "Pad 4"])
+    advGui.Add("Text", "x210 yp+3 w70", "Trigger at:")
+    trigEdit := advGui.Add("Edit", "x282 yp-3 w50", padTrigThresh)
+    advGui.Add("Text", "x20 y+12 w85", "Deadzone %:")
+    msDeadEdit := advGui.Add("Edit", "x105 yp-3 w50", padMouseDead)
+    advGui.Add("Text", "x210 yp+3 w70", "Curve:")
+    msCurveEdit := advGui.Add("Edit", "x282 yp-3 w50 r1", Round(padMouseCurve, 2))
+    advGui.Add("Text", "x20 y+12 w100", "Mouse speed %:")
+    scaleEdit := advGui.Add("Edit", "x125 yp-3 w50", mouseScale)
+    advGui.Add("Text", "x185 yp+3 w150", "(m / mm / mshake / mh)")
+
+    advGui.Add("GroupBox", "xm y+22 w340 h60", "System")
+    adminCB := advGui.Add("Checkbox", "x20 yp+26 " . (runAsAdmin ? "Checked" : ""), "Run as Administrator (applies after restart)")
+
+    advGui.Add("GroupBox", "xm y+22 w340 h115", "Custom RGB Theme Pickers (HEX)")
+    advGui.Add("Text", "x20 yp+28 w130", "Window Background:")
+    bgHexEdit := advGui.Add("Edit", "x150 yp-3 w70", customBgColor)
+    advGui.Add("Text", "x20 y+12 w130", "Control Background:")
+    ctrlHexEdit := advGui.Add("Edit", "x150 yp-3 w70", customControlColor)
+    advGui.Add("Text", "x20 y+12 w130", "Text Color:")
+    textHexEdit := advGui.Add("Edit", "x150 yp-3 w70", customTextColor)
+    advCloseBtn := advGui.Add("Button", "xm y+22 w120 h30", "Done")
+    advCloseBtn.OnEvent("Click", (*) => advGui.Hide())
+    advGui.OnEvent("Close", (*) => advGui.Hide())
+    advGui.Show("Hide")
+    advGui.GetClientPos(, , &advCW, &advCH)
+    advCloseBtn.GetPos(, &advBtnY, , &advBtnH)
+    advContentH := advBtnY + advBtnH + 15
+    MonitorGetWorkArea(, , &advWaTop, , &advWaBottom)
+    advShowH := Min(advContentH, (advWaBottom - advWaTop) - 110)
+    advW := advCW + 24
+    MakeGuiScrollable(advGui, advContentH)
+
+    ShowAdvanced() {
+        advGui.Show("w" . advW . " h" . advShowH)
+        ScrollGuiRefresh(advGui.Hwnd)
+    }
+
+    AddTip(compatDD, "How keys and the mouse are sent. If a game ignores the keys, try another mode.")
+    AddTip(adminCB, "Run as administrator. Needed when the game runs as admin. Applies after a restart.")
+    AddTip(autoProfCB, "Switches profile by itself when you open a game whose profile has that Target EXE.")
+    AddTip(pressExtraEdit, "Extra milliseconds added to every key press. Helps timed prompts and games that miss short taps.")
+    AddTip(padTypeDD, "Auto uses either pad. Xbox reads only Xbox-style pads. PS4 reads only DirectInput pads such as a DualShock.")
+    AddTip(padDD, "Which Xbox controller slot to read. Auto picks the first one connected.")
+    AddTip(trigEdit, "How far an Xbox trigger (LT/RT) must be pressed to count as a button, 0 to 255.")
+    AddTip(msDD, "Lets a stick move the mouse.")
+    AddTip(msSpeedEdit, "Mouse speed in pixels per second with the stick fully pushed.")
+    AddTip(msDeadEdit, "Percent of stick travel ignored around the centre, so a resting stick does not drift.")
+    AddTip(msCurveEdit, "1 = even response. Higher = finer control near the centre and fast at the edge.")
+    AddTip(scDD, "Lets a stick scroll the mouse wheel.")
+    AddTip(scSpeedEdit, "Scroll notches per second with the stick fully pushed.")
+    AddTip(scaleEdit, "Scales every mouse move token (m, mm, mshake, mh). 100 = normal.")
+    AddTip(padPanicCB, "Hold the on/off buttons for 1 second to turn the remapper off. Hold them again to turn it back on.")
+    AddTip(padSwitchEdit, "Your own on/off buttons, joined with +, for example XLB+XRB+XSTART or J5+J6. Leave blank for the default: Start+Back (Xbox) / Share+Options (PS4).")
+    AddTip(padSwitchBtn, "Click, hold the buttons you want together on the controller, then let go.")
+    AddTip(scrollKeyEdit, "Key that sends a mouse wheel scroll click. Press Bind and then the key you want.")
+    AddTip(scrollOffCB, "Tick to switch the scroll-click key off completely.")
+    AddTip(yLockEdit, "Key that locks the mouse to its current height (Y axis). Press it again to unlock.")
+    AddTip(yLockOffCB, "Tick to switch the Y-axis lock off completely.")
+    AddTip(kdEdit, "Pause after each key event, in milliseconds.")
+    AddTip(kpEdit, "How long each key is held down for a press, in milliseconds.")
+    AddTip(mdEdit, "Pause after each mouse action, in milliseconds.")
+    AddTip(controllerCB, "Turns controller reading on or off.")
+    settingsGui.OnEvent("Close", (*) => (advGui.Destroy(), settingsGui.Destroy()))
     settingsGui.Show("Hide")
     saveBtn.GetPos(, &btnY, , &btnH)
     settingsContentH := btnY + btnH + 15
@@ -2339,13 +3365,15 @@ OpenSettingsPanel(*) {
     settingsShowH := Min(settingsContentH, (waBottom - waTop) - 110)
     settingsGui.Show("w" . (settingsCW + 24) . " h" . settingsShowH)
     MakeGuiScrollable(settingsGui, settingsContentH)
+    StartTips(settingsGui.Hwnd)
 
     SaveSettingsAction() {
         global keyDelayDuration, keyDelayPress, mouseDelayDuration, soundAlerts, showTooltips, showOsd, osdLocked, osdToggleKey
         global customBgColor, customControlColor, customTextColor, Themes, osdGui, scriptEnabled, currentTheme, configFile
-        global controllerEnabled, compatMode, runAsAdmin, globalSettingsFile
-        global padType, padPort, padMouseStick, padScrollStick, padMouseSpeed, padMouseDead, padMouseCurve
-        global padScrollSpeed, padTrigThresh, mouseScale
+        global controllerEnabled, compatMode, runAsAdmin, globalSettingsFile, autoProfile
+        global pressExtraMs, padPanic, padType, padPort, padMouseStick, padScrollStick, padMouseSpeed, padMouseDead, padMouseCurve
+        global padScrollSpeed, padTrigThresh, mouseScale, padSwitchCombo
+        global scrollTriggerKey, yLockKey, scrollKeyBox, panicKey
 
         ; Switch input mode: release anything held with the OLD method first
         if (compatDD.Value >= 1 && compatDD.Value != compatMode) {
@@ -2353,11 +3381,13 @@ OpenSettingsPanel(*) {
             compatMode := compatDD.Value
             BuildTrayMenu()
         }
+        if ((autoProfCB.Value ? true : false) != autoProfile)
+            ToggleAutoProfile()
         newAdmin := adminCB.Value ? true : false
         if (newAdmin != runAsAdmin) {
             runAsAdmin := newAdmin
             try IniWrite(runAsAdmin ? 1 : 0, globalSettingsFile, "Global", "RunAsAdmin")
-            MsgBox("The Administrator setting applies the next time the remapper starts.", "Combo ReMapper 8.19", "Iconi")
+            MsgBox("The Administrator setting applies the next time the remapper starts.", "Combo ReMapper 9.0", "Iconi")
         }
 
         if IsNumber(kdEdit.Text) && IsNumber(kpEdit.Text) && IsNumber(mdEdit.Text) {
@@ -2389,6 +3419,10 @@ OpenSettingsPanel(*) {
         if (padTypeDD.Value >= 1 && padTypeDD.Value != padType)
             SetPadType(padTypeDD.Value)
         padPort := padDD.Value - 1
+        if IsInteger(pressExtraEdit.Text)
+            pressExtraMs := Max(0, Min(500, Integer(pressExtraEdit.Text)))
+        padPanic := padPanicCB.Value ? true : false
+        padSwitchCombo := StrUpper(RegExReplace(Trim(padSwitchEdit.Text), "\s+", ""))
         padMouseStick := msDD.Value - 1
         padScrollStick := scDD.Value - 1
         if IsInteger(trigEdit.Text)
@@ -2407,6 +3441,21 @@ OpenSettingsPanel(*) {
 
         osdToggleKey := Trim(osdKeyBox.Text)
         RegisterOsdHotkey()
+
+        ; Scroll-click key and Y-axis lock key (a ticked Off box disables the feature)
+        newScroll := scrollOffCB.Value ? "" : Trim(scrollKeyEdit.Text)
+        newYLock := yLockOffCB.Value ? "" : Trim(yLockEdit.Text)
+        if (newYLock != "" && (StrUpper(newYLock) = StrUpper(newScroll) || StrUpper(newYLock) = StrUpper(panicKey) || StrUpper(newYLock) = StrUpper(osdToggleKey))) {
+            MsgBox("The Y-axis lock key ('" . newYLock . "') is already used by another hotkey. Pick a different one.", "Combo ReMapper 9.0", "Icon!")
+            newYLock := yLockKey
+        }
+        scrollTriggerKey := newScroll
+        if (scrollKeyBox != "")
+            scrollKeyBox.Text := scrollTriggerKey
+        RegisterScrollHotkey()
+        yLockKey := newYLock
+        RegisterYLockHotkey()
+        RegisterYLockHotkey()
 
         if (osdGui != "") {
             osdGui.Destroy()
@@ -2428,6 +3477,7 @@ OpenSettingsPanel(*) {
         SaveStateToINI(configFile)
         ApplyTheme(currentTheme)
 
+        try advGui.Destroy()
         settingsGui.Destroy()
         NotifyUser("Settings successfully applied!")
     }
@@ -2736,6 +3786,7 @@ SwitchProfile(ctrl, *) {
     RegisterScrollHotkey()
     RegisterPanicHotkey()
     RegisterOsdHotkey()
+    RegisterYLockHotkey()
     BuildTrayMenu()
 
     scrollOffset := 0
@@ -2824,6 +3875,7 @@ DeleteProfile(*) {
     RegisterScrollHotkey()
     RegisterPanicHotkey()
     RegisterOsdHotkey()
+    RegisterYLockHotkey()
     BuildTrayMenu()
 
     scrollOffset := 0
@@ -2869,7 +3921,7 @@ SyncBoxesToRows() {
             row.trigger := Trim(rowUI[slotIdx].tb.Text)
             row.keys := ParseKeyList(rowUI[slotIdx].cb.Text)
             modeText := rowUI[slotIdx].dd.Text
-            row.mode := (modeText = "Toggle") ? "toggle" : ((modeText = "Press") ? "press" : ((modeText = "Turbo") ? "turbo" : ((modeText = "TapHold") ? "taphold" : "hold")))
+            row.mode := (modeText = "Toggle") ? "toggle" : ((modeText = "Press") ? "press" : ((modeText = "Turbo") ? "turbo" : ((modeText = "TapHold") ? "taphold" : ((modeText = "DblTap") ? "doubletap" : ((modeText = "TglTurbo") ? "autoturbo" : "hold")))))
             row.enabled := rowUI[slotIdx].enChk.Value ? true : false
         }
     }
@@ -2916,7 +3968,7 @@ RenderAll(updateSliderVal := true) {
             row := rows[rowIdx]
             rowUI[slotIdx].tb.Text := row.trigger
             rowUI[slotIdx].cb.Text := KeyListToString(row.keys)
-            rowUI[slotIdx].dd.Choose(row.mode = "toggle" ? 2 : (row.mode = "press" ? 3 : (row.mode = "turbo" ? 4 : (row.mode = "taphold" ? 5 : 1))))
+            rowUI[slotIdx].dd.Choose(row.mode = "toggle" ? 2 : (row.mode = "press" ? 3 : (row.mode = "turbo" ? 4 : (row.mode = "taphold" ? 5 : (row.mode = "doubletap" ? 6 : (row.mode = "autoturbo" ? 7 : 1))))))
             rowUI[slotIdx].enChk.Value := (row.HasOwnProp("enabled") ? row.enabled : true) ? 1 : 0
 
             rowUI[slotIdx].tb.Visible := true
@@ -3001,7 +4053,7 @@ ApplyChanges(*) {
     SyncBoxesToRows()
 
     if (panicKey = "") {
-        MsgBox("The panic toggle key cannot be blank. This is required for safety.", "Combo ReMapper 8.19", "Icon!")
+        MsgBox("The panic toggle key cannot be blank. This is required for safety.", "Combo ReMapper 9.0", "Icon!")
         return
     }
 
@@ -3011,11 +4063,11 @@ ApplyChanges(*) {
             continue
         cleanTrig := RegExReplace(StrUpper(row.trigger), "^~")
         if (cleanTrig = StrUpper(panicKey)) {
-            MsgBox("'" row.trigger "' is reserved for the panic toggle and can't be a trigger key. Nothing was saved.", "Combo ReMapper 8.19", "Icon!")
+            MsgBox("'" row.trigger "' is reserved for the panic toggle and can't be a trigger key. Nothing was saved.", "Combo ReMapper 9.0", "Icon!")
             return
         }
         if (seenTriggers.Has(cleanTrig)) {
-            MsgBox("'" row.trigger "' is used as a trigger key on more than one row. Please make each trigger key unique.", "Combo ReMapper 8.19", "Icon!")
+            MsgBox("'" row.trigger "' is used as a trigger key on more than one row. Please make each trigger key unique.", "Combo ReMapper 9.0", "Icon!")
             return
         }
         seenTriggers[cleanTrig] := true
@@ -3023,21 +4075,23 @@ ApplyChanges(*) {
 
     if (scrollTriggerKey != "") {
         if (StrUpper(scrollTriggerKey) = StrUpper(panicKey)) {
-            MsgBox("The scroll-click key can't be the panic toggle. Nothing was saved.", "Combo ReMapper 8.19", "Icon!")
+            MsgBox("The scroll-click key can't be the panic toggle. Nothing was saved.", "Combo ReMapper 9.0", "Icon!")
             return
         }
         if (seenTriggers.Has(StrUpper(scrollTriggerKey))) {
-            MsgBox("The scroll-click key ('" scrollTriggerKey "') is the same as one of your row trigger keys. Pick a different one.", "Combo ReMapper 8.19", "Icon!")
+            MsgBox("The scroll-click key ('" scrollTriggerKey "') is the same as one of your row trigger keys. Pick a different one.", "Combo ReMapper 9.0", "Icon!")
             return
         }
     }
 
     ReleaseAllHeldCombos()
+    SetTimer(() => ShowComboCheck(false), -300)
 
     RegisterRowHotkeys()
     RegisterScrollHotkey()
     RegisterPanicHotkey()
     RegisterOsdHotkey()
+    RegisterYLockHotkey()
 
     SaveStateToINI(configFile)
 
@@ -3058,3 +4112,4 @@ if (controllerEnabled) {
     StartControllerPolling()
 }
 SetTimer(FocusWatch, 250)
+SetTimer(AutoProfileTick, 600)
