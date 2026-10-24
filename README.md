@@ -2,9 +2,9 @@
 
 A personal collection of input-automation and accessibility tools, mostly built for
 one-handed / limited-input play on a handful of PC games (native and emulated), plus
-two unrelated side projects that happen to live in the same folder. This README is a
-map of the whole folder — what each thing is, which version to actually use, and what
-you need to run it.
+several utility scripts that live in the same folder. This README is a map of the
+whole folder — what each thing is, which version to actually use, and what you need
+to run it.
 
 Everything here that touches a game only simulates keypresses/mouse input. Nothing
 patches game files or reads/writes process memory.
@@ -19,7 +19,7 @@ mostly a pointer/landing area and contains older or reference builds.
 
 | Tool | Get it from | Used by |
 |---|---|---|
-| **AutoHotkey v2** (not v1!) | https://www.autohotkey.com | Combo Remapper, Bully lockpick macros, RPCS3 QTE assist, Krita OSK, Math OSK |
+| **AutoHotkey v2** (not v1!) | https://www.autohotkey.com | Combo Remapper, Lockpick macros, RPCS3 QTE assist, Krita OSK, Math OSK, OSK Maker |
 | **AutoIt v3** | https://www.autoitscript.com/site/autoit/downloads/ | NMH Ultimate Accessibility OS, FF7 Universal Accessibility OS (unfinished) |
 | **Rust toolchain** (only if rebuilding from source) | https://rustup.rs | `b.rs` (`rust_clicker`) |
 
@@ -35,19 +35,18 @@ editor if you want to verify what it actually does before allowing it.
 
 ---
 
-## Current tools, by game
+## Current tools and active builds
 
 ### Bully: Scholarship Edition (PCSX2) — Combo Remapper
-**Current file:** `scRIIPS/scRIIPS/Combo ReMapper 8.12 — TRAY   OSD LOCK.ahk` / `.exe`
+**Current file:** `scRIIPS/scRIIPS/Combo_ReMapper_9_5.ahk` / `.exe`
 **Config:** `scRIIPS/scRIIPS/combo_config.ini`, `scRIIPS/scRIIPS/remapper_global.ini`, `scRIIPS/scRIIPS/profiles/`
 
 Turns held key-combos into single-key triggers, with a full GUI: unlimited combo
 rows, Hold/Toggle/Press/Turbo/TapHold modes, multi-profile save/switch/import/export,
 a lockable on-screen HUD, themes, a key/mouse recorder, panic-toggle hotkey, per-row
-enable/disable, and a target-exe filter. See `combo_remapper_README.md` for the
-original quick-start. The current build is the 8.12 GUI version, and the `profiles/`
-folder holds saved combo sets; `remapper_global.ini` remembers the last-used profile so
-it reopens automatically.
+enable/disable, and a target-exe filter. The current active build is the 9.5 GUI
+version, and the `profiles/` folder holds saved combo sets; `remapper_global.ini`
+remembers the last-used profile so it reopens automatically.
 
 ### Bully: Scholarship Edition (PCSX2) — Lockpicking Assist
 **Files:** `scRIIPS/scRIIPS/bully_lockpick_macro ps 2(2).ahk` (keyboard-tap version) and
@@ -94,20 +93,32 @@ RePOP's scroll-wheel-only sequences (e.g. the Zombie Baseball minigame) can't be
 fixed by any script — Windows blocks simulated scroll input as "injected," and RePOP
 filters it. That's a wall on the game/OS side, not something in this folder.
 
-### Krita — On-Screen Keyboard
-**File:** `scRIIPS/scRIIPS/krita_osk (4).ahk` / `.exe`
+### Krita — On-Screen Keyboard (v5)
+**File:** `scRIIPS/scRIIPS/krita osk  5.ahk` / `.exe`
 
 A resizable, semi-transparent, tabbed shortcut bar docked at the bottom of the
 screen for one-handed use in Krita: brush, canvas/view, layers, and edit/select
 tabs, a Pan hold-toggle, and a Custom tab. Sends keystrokes to whichever window was
 last active (so you can click back into Krita and it still targets it).
 
-### Math On-Screen Keyboard (school use)
-**File:** `scRIIPS/scRIIPS/math_osk (4).ahk` / `.exe`
+### Math On-Screen Keyboard (school use, v5)
+**File:** `scRIIPS/scRIIPS/math_osk  5.ahk` / `.exe`
 
 Same "docked bar" style as Windows' own On-Screen Keyboard, but with math
 symbols/operators instead of letters — types the symbol directly into whatever's
 focused. Includes a "Snap to Bottom" button; maximizing is disabled by design.
+
+### OSK Maker — custom on-screen keyboard designer
+**Current file:** `scRIIPS/scRIIPS/OSK_Maker.ahk`
+**Layout file:** `scRIIPS/scRIIPS/layout.osk`
+
+This is the new general-purpose generator: a lightweight AutoHotkey GUI that lets you
+make your own custom on-screen keyboard layouts, save them as `.osk` files, and then
+export the finished design as either a standalone `.ahk` script or a compiled `.exe`.
+It supports `Text`, `Send`, and `Hold` actions, sticky Ctrl/Shift/Alt modifiers, hover
+mode, and built-in presets for a math keyboard and a Krita-friendly layout. This is the
+"Maker" script people are looking for when they want a reusable OSK builder rather than
+one-off hardcoded keyboards.
 
 ### Final Fantasy VII (1997 / Remake / Rebirth / Crisis Core Reunion) — Universal Accessibility OS
 **Current file:** `scRIIPS/scRIIPS/unfinisd/ff7C 7.au3` — **unfinished / work in progress**
@@ -137,7 +148,7 @@ English/Hungarian speech-to-code dictation with an F5 toggle.
 - **`scRIIPS/scRIIPS/profiles/`** / **`scRIIPS/scRIIPS/nmh_profiles/`** — Saved keybind/combo profiles (INI files)
   for the Combo Remapper and NMH OS respectively.
 - **`scRIIPS/scRIIPS/unfinisd/`** — Work-in-progress and in-development scripts, including the
-  current NMH build and the unfinished FF7 OS.
+  current NMH build and unfinished FF7 OS.
   - **`scRIIPS/scRIIPS/unfinisd/old/`** — Version-history graveyard: older numbered/lettered
     iterations of the Combo Remapper, NMH GUI, and RPCS3 QTE scripts. Useful for
     diffing against the current build or recovering an older behavior, otherwise
